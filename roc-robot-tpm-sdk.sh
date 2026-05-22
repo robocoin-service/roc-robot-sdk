@@ -2,13 +2,14 @@
 set -euo pipefail
 
 SDK_VERSION="0.4.0-github-bind-agent"
+DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://172.16.18.187:8090}"
 if [ "$#" -lt 1 ]; then
   printf 'Usage:\n' >&2
   printf '  One-step: %s bind <sdkBindingToken> [serverUrl] [tpmHandle]\n' "$0" >&2
   printf '  Register: %s register <robotId> <ownerUserId> <serverUrl> <sdkBindingToken> [tpmHandle]\n' "$0" >&2
   printf '  Legacy:   %s <robotId> <ownerUserId> <serverUrl> <sdkBindingToken> [tpmHandle]\n' "$0" >&2
   printf '  Stage:    %s stage <serverUrl> <verificationId> <orderId> <taskId> <robotId> <stage> <nonce> <challengePayload> [tpmHandle]\n' "$0" >&2
-  printf '  Agent:    %s agent <robotId> <serverUrl> [tpmHandle]\n' "$0" >&2
+  printf '  Agent:    %s agent <robotId> [serverUrl] [tpmHandle]\n' "$0" >&2
   exit 1
 fi
 
@@ -19,7 +20,7 @@ if [ "$MODE" = "bind" ] || [ "$MODE" = "install" ]; then
     exit 1
   fi
   SDK_BINDING_TOKEN="$2"
-  SERVER_URL="${3:-${ROC_SERVER_URL:-http://localhost:8090}}"
+  SERVER_URL="${3:-$DEFAULT_SERVER_URL}"
   TPM_HANDLE="${4:-0x81010010}"
   ROBOT_ID=""
   OWNER_USER_ID=""
@@ -53,12 +54,12 @@ elif [ "$MODE" = "stage" ]; then
   SDK_BINDING_TOKEN=""
   AUTO_START_AGENT=0
 elif [ "$MODE" = "agent" ]; then
-  if [ "$#" -lt 3 ]; then
-    printf 'Usage: %s agent <robotId> <serverUrl> [tpmHandle]\n' "$0" >&2
+  if [ "$#" -lt 2 ]; then
+    printf 'Usage: %s agent <robotId> [serverUrl] [tpmHandle]\n' "$0" >&2
     exit 1
   fi
   ROBOT_ID="$2"
-  SERVER_URL="$3"
+  SERVER_URL="${3:-$DEFAULT_SERVER_URL}"
   TPM_HANDLE="${4:-0x81010010}"
   OWNER_USER_ID=""
   SDK_BINDING_TOKEN=""

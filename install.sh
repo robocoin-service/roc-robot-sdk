@@ -14,7 +14,7 @@ Usage:
   bash install.sh <sdkBindingToken>
 
 Example:
-  ROC_SERVER_URL=http://172.16.18.187:8090 bash install.sh abc123
+  bash install.sh abc123
 
 Environment:
   ROC_SDK_REPO_URL       Git repository URL. Default: $DEFAULT_REPO_URL

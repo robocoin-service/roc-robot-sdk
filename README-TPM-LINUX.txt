@@ -11,10 +11,10 @@ Recommended one-step install
 2. Copy the SDK binding token shown by the page.
 3. On the Linux industrial PC, run:
 
-curl -fsSL https://raw.githubusercontent.com/robocoin-service/roc-robot-sdk/main/install.sh | ROC_SERVER_URL=http://172.16.18.187:8090 bash -s -- <sdkBindingToken>
+curl -fsSL https://raw.githubusercontent.com/robocoin-service/roc-robot-sdk/main/install.sh | bash -s -- <sdkBindingToken>
 
 Example:
-curl -fsSL https://raw.githubusercontent.com/robocoin-service/roc-robot-sdk/main/install.sh | ROC_SERVER_URL=http://172.16.18.187:8090 bash -s -- 8a7f2c4e9d7b4c0aa123456789abcdef
+curl -fsSL https://raw.githubusercontent.com/robocoin-service/roc-robot-sdk/main/install.sh | bash -s -- 8a7f2c4e9d7b4c0aa123456789abcdef
 
 The installer clones the SDK repository, installs dependencies if apt-get is available, binds the TPM public key to the robot registration record, then starts the Agent.
 
@@ -37,10 +37,10 @@ Stage example
 ./roc-robot-tpm-sdk.sh stage http://your-server:8090 7 21 13 12 DEPARTED abc123 "orderId=21;taskId=13;robotId=12;..."
 
 Agent command
-./roc-robot-tpm-sdk.sh agent <robotId> <serverUrl> [tpmHandle]
+./roc-robot-tpm-sdk.sh agent <robotId> [serverUrl] [tpmHandle]
 
 Agent example
-./roc-robot-tpm-sdk.sh agent 12 http://your-server:8090
+./roc-robot-tpm-sdk.sh agent 12
 
 Agent behavior
 After robot registration is confirmed by the user, keep the agent running on the industrial PC.
