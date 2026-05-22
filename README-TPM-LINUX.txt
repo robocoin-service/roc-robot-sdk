@@ -11,10 +11,10 @@ Recommended one-step install
 2. Copy the SDK binding token shown by the page.
 3. On the Linux industrial PC, run:
 
-curl -fsSL https://raw.githubusercontent.com/robocoin-service/roc-robot-sdk/main/install.sh | bash -s -- <sdkBindingToken> <serverUrl>
+curl -fsSL https://raw.githubusercontent.com/robocoin-service/roc-robot-sdk/main/install.sh | ROC_SERVER_URL=http://172.16.18.187:8090 bash -s -- <sdkBindingToken>
 
 Example:
-curl -fsSL https://raw.githubusercontent.com/robocoin-service/roc-robot-sdk/main/install.sh | bash -s -- 8a7f2c4e9d7b4c0aa123456789abcdef http://your-server:8090
+curl -fsSL https://raw.githubusercontent.com/robocoin-service/roc-robot-sdk/main/install.sh | ROC_SERVER_URL=http://172.16.18.187:8090 bash -s -- 8a7f2c4e9d7b4c0aa123456789abcdef
 
 The installer clones the SDK repository, installs dependencies if apt-get is available, binds the TPM public key to the robot registration record, then starts the Agent.
 

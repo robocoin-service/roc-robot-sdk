@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SDK_VERSION="0.4.0-github-bind-agent"
-DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://localhost:8090}"
+DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://172.16.18.187:8090}"
 DEFAULT_REPO_URL="${ROC_SDK_REPO_URL:-https://github.com/robocoin-service/roc-robot-sdk.git}"
 INSTALL_DIR="${ROC_SDK_INSTALL_DIR:-$HOME/roc-robot-sdk}"
 
@@ -11,10 +11,10 @@ usage() {
 ROC Robot SDK installer
 
 Usage:
-  bash install.sh <sdkBindingToken> [serverUrl]
+  bash install.sh <sdkBindingToken>
 
 Example:
-  bash install.sh abc123 http://your-server:8090
+  ROC_SERVER_URL=http://172.16.18.187:8090 bash install.sh abc123
 
 Environment:
   ROC_SDK_REPO_URL       Git repository URL. Default: $DEFAULT_REPO_URL
@@ -65,7 +65,7 @@ install_dependencies_if_needed() {
 }
 
 SDK_BINDING_TOKEN="${1:-}"
-SERVER_URL="${2:-$DEFAULT_SERVER_URL}"
+SERVER_URL="$DEFAULT_SERVER_URL"
 
 if [ -z "$SDK_BINDING_TOKEN" ] || [ "$SDK_BINDING_TOKEN" = "-h" ] || [ "$SDK_BINDING_TOKEN" = "--help" ]; then
   usage

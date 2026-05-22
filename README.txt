@@ -2,7 +2,7 @@ ROC Robot SDK
 
 Linux TPM robot recommended one-step install:
 
-curl -fsSL https://raw.githubusercontent.com/robocoin-service/roc-robot-sdk/main/install.sh | bash -s -- <sdkBindingToken> <serverUrl>
+curl -fsSL https://raw.githubusercontent.com/robocoin-service/roc-robot-sdk/main/install.sh | ROC_SERVER_URL=http://172.16.18.187:8090 bash -s -- <sdkBindingToken>
 
 Manual command after clone:
 
