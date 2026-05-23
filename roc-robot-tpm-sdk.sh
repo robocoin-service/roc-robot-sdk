@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SDK_VERSION="0.4.0-github-bind-agent"
+SDK_VERSION="0.5.0-agent-heartbeat"
 DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://172.16.18.187:8090}"
 if [ "$#" -lt 1 ]; then
   printf 'Usage:\n' >&2
@@ -127,12 +127,14 @@ require_cmd tpm2_readpublic
 require_cmd tpm2_sign
 require_cmd tpm2_evictcontrol
 require_cmd tpm2_createek
+require_cmd tpm2_getrandom
 require_cmd openssl
 require_cmd python3
 require_cmd curl
 require_cmd sha256sum
 require_cmd base64
 require_cmd lscpu
+require_cmd xxd
 if [ "$MODE" = "agent" ]; then
   require_cmd sed
 fi
@@ -152,6 +154,7 @@ SIG_FILE="$WORK_DIR/challenge.sig"
 REPORT_JSON="$OUTPUT_DIR/device-report.json"
 REPORT_TXT="$OUTPUT_DIR/device-report.txt"
 STAGE_REPORT_JSON="$OUTPUT_DIR/stage-report.json"
+HEARTBEAT_REPORT_JSON="$OUTPUT_DIR/heartbeat-report.json"
 
 log "Checking TPM 2.0 device..."
 tpm2_getcap properties-fixed >/dev/null
@@ -240,12 +243,63 @@ JSON
   printf '%s\n' "$HTTP_RESPONSE" | tee "$OUTPUT_DIR/stage-server-response.json"
 }
 
+send_heartbeat() {
+  local heartbeat_at
+  local nonce
+  local interval
+  local payload
+  heartbeat_at="$(date '+%Y-%m-%d %H:%M:%S')"
+  nonce="$(date +%s%N)-$(tpm2_getrandom 16 | xxd -p -c 256)"
+  interval="${ROC_HEARTBEAT_INTERVAL_SECONDS:-30}"
+  payload="event=HEARTBEAT;robotId=$ROBOT_ID;publicKeyFingerprint=$PUBLIC_KEY_FINGERPRINT;machineFingerprint=$MACHINE_FINGERPRINT;sdkVersion=$SDK_VERSION;nonce=$nonce;heartbeatAt=$heartbeat_at"
+  printf '%s' "$payload" > "$PAYLOAD_FILE"
+  tpm2_sign -c "$TPM_HANDLE" -g sha256 -s rsassa -f plain -o "$SIG_FILE" "$PAYLOAD_FILE"
+  openssl dgst -sha256 -verify "$KEY_PEM" -signature "$SIG_FILE" "$PAYLOAD_FILE" >/dev/null
+  SIGNATURE_B64="$(base64 -w 0 "$SIG_FILE")"
+
+  cat > "$HEARTBEAT_REPORT_JSON" <<JSON
+{
+  "robotId": $ROBOT_ID,
+  "sdkVersion": "$(printf '%s' "$SDK_VERSION")",
+  "deviceType": "LINUX_TPM_ROBOT",
+  "computerName": $(json_value "$COMPUTER_NAME"),
+  "cpuModel": $(json_value "$CPU_MODEL"),
+  "machineFingerprint": $(json_value "$MACHINE_FINGERPRINT"),
+  "publicKeyFingerprint": $(json_value "$PUBLIC_KEY_FINGERPRINT"),
+  "heartbeatAt": $(json_value "$heartbeat_at"),
+  "heartbeatIntervalSeconds": $interval,
+  "nonce": $(json_value "$nonce"),
+  "signatureAlgorithm": "RSASSA-SHA256",
+  "signaturePrivateKey": "TPM_NON_EXPORTABLE",
+  "signaturePayload": $(json_value "$payload"),
+  "signature": $(json_value "$SIGNATURE_B64")
+}
+JSON
+
+  API_URL="${SERVER_URL%/}/user/sdkAgent/heartbeat"
+  HTTP_RESPONSE="$(curl -sS -H 'Content-Type: application/json; charset=utf-8' --data-binary "@$HEARTBEAT_REPORT_JSON" "$API_URL" || true)"
+  printf '%s\n' "$HTTP_RESPONSE" > "$OUTPUT_DIR/heartbeat-server-response.json"
+  if printf '%s' "$HTTP_RESPONSE" | grep -q '"code":200'; then
+    log "Heartbeat verified at $heartbeat_at"
+  else
+    log "Heartbeat submit failed: $HTTP_RESPONSE"
+  fi
+}
+
 if [ "$MODE" = "agent" ]; then
   log "Starting DeRAS SDK agent for robot $ROBOT_ID"
   log "TPM public key fingerprint: $PUBLIC_KEY_FINGERPRINT"
   log "Server: $SERVER_URL"
+  log "Heartbeat interval: ${ROC_HEARTBEAT_INTERVAL_SECONDS:-30}s"
   log "Press Ctrl+C to stop."
+  LAST_HEARTBEAT_TS=0
   while true; do
+    NOW_TS="$(date +%s)"
+    HEARTBEAT_INTERVAL="${ROC_HEARTBEAT_INTERVAL_SECONDS:-30}"
+    if [ $((NOW_TS - LAST_HEARTBEAT_TS)) -ge "$HEARTBEAT_INTERVAL" ]; then
+      send_heartbeat
+      LAST_HEARTBEAT_TS="$NOW_TS"
+    fi
     PENDING_URL="${SERVER_URL%/}/user/sdkAgent/pendingChallenge?robotId=$ROBOT_ID&publicKeyFingerprint=$PUBLIC_KEY_FINGERPRINT"
     PENDING_JSON="$(curl -sS "$PENDING_URL" || true)"
     HAS_CHALLENGE="$(printf '%s' "$PENDING_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(str(d.get("data",{}).get("hasChallenge", False)).lower())' 2>/dev/null || printf 'false')"

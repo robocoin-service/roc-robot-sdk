@@ -4,6 +4,7 @@ Purpose
 - Read the TPM business public key and EK public key.
 - Ask the TPM private key to sign a challenge payload.
 - Submit robotId, ownerUserId, sdkBindingToken, CPU/TPM information, public key fingerprint and signature to roc-server.
+- Keep a TPM-signed heartbeat with DeRAS so the platform can see whether the robot Agent is online.
 - Sign DeRAS order-stage challenges so the platform can verify the bound TPM device participated.
 
 Recommended one-step install
@@ -44,7 +45,8 @@ Agent example
 
 Agent behavior
 After robot registration is confirmed by the user, keep the agent running on the industrial PC.
-When the provider clicks Departed/Arrived/Start Request/End Request in DeRAS, the server creates a challenge.
+The agent sends a TPM-signed heartbeat every 30 seconds. DeRAS treats the robot as online only when the latest heartbeat is recent and verified.
+When the provider clicks Departed/Start Request/End Request in DeRAS, the server creates a challenge.
 The agent polls the server, signs the challenge with TPM, and submits the report automatically.
 
 Binding rule
@@ -55,4 +57,5 @@ The sdkBindingToken is valid for 10 minutes and becomes invalid immediately afte
 
 Success signal
 For registration, the server response should contain signatureVerified=true, bindingStatus=BOUND or MATCHED, and reportId.
+For heartbeat, the log should periodically print Heartbeat verified.
 For stage verification, the server response should contain status=PASSED and signatureVerified=true.

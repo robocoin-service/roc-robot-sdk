@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SDK_VERSION="0.4.0-github-bind-agent"
+SDK_VERSION="0.5.0-agent-heartbeat"
 DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://172.16.18.187:8090}"
 DEFAULT_REPO_URL="${ROC_SDK_REPO_URL:-https://github.com/robocoin-service/roc-robot-sdk.git}"
 INSTALL_DIR="${ROC_SDK_INSTALL_DIR:-$HOME/roc-robot-sdk}"
@@ -36,7 +36,7 @@ require_cmd() {
 
 install_dependencies_if_needed() {
   local missing=""
-  for cmd in git curl python3 openssl sha256sum base64 lscpu tpm2_getcap tpm2_createprimary tpm2_create tpm2_load tpm2_readpublic tpm2_sign tpm2_evictcontrol tpm2_createek; do
+  for cmd in git curl python3 openssl sha256sum base64 lscpu xxd tpm2_getcap tpm2_createprimary tpm2_create tpm2_load tpm2_readpublic tpm2_sign tpm2_evictcontrol tpm2_createek tpm2_getrandom; do
     if ! require_cmd "$cmd"; then
       missing="$missing $cmd"
     fi
@@ -55,12 +55,12 @@ install_dependencies_if_needed() {
   if require_cmd apt-get; then
     log "Installing required packages with apt-get. Sudo password may be required."
     sudo apt-get update
-    sudo apt-get install -y git curl python3 openssl coreutils util-linux tpm2-tools
+    sudo apt-get install -y git curl python3 openssl coreutils util-linux xxd tpm2-tools
     return 0
   fi
 
   log "Cannot install dependencies automatically on this Linux distribution."
-  log "Please install: git curl python3 openssl coreutils util-linux tpm2-tools"
+  log "Please install: git curl python3 openssl coreutils util-linux xxd tpm2-tools"
   exit 1
 }
 
