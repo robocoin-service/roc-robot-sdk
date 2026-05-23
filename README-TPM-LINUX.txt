@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/robocoin-service/roc-robot-sdk/main
 Example:
 curl -fsSL https://raw.githubusercontent.com/robocoin-service/roc-robot-sdk/main/install.sh | bash -s -- 8a7f2c4e9d7b4c0aa123456789abcdef
 
-The installer clones the SDK repository, installs dependencies if apt-get is available, binds the TPM public key to the robot registration record, then starts the Agent.
+The installer clones the SDK repository, installs dependencies if apt-get is available, binds the TPM public key to the robot registration record, then creates and starts a systemd service named roc-robot-agent.
 
 One-step local command after clone
 ./roc-robot-tpm-sdk.sh bind <sdkBindingToken> [serverUrl] [tpmHandle]
@@ -44,10 +44,15 @@ Agent example
 ./roc-robot-tpm-sdk.sh agent 12
 
 Agent behavior
-After robot registration is confirmed by the user, keep the agent running on the industrial PC.
+After robot registration is confirmed by the user, the systemd service keeps the agent running on the industrial PC.
 The agent sends a TPM-signed heartbeat every 30 seconds. DeRAS treats the robot as online only when the latest heartbeat is recent and verified.
 When the provider clicks Departed/Start Request/End Request in DeRAS, the server creates a challenge.
 The agent polls the server, signs the challenge with TPM, and submits the report automatically.
+
+Service commands
+sudo systemctl status roc-robot-agent
+sudo systemctl restart roc-robot-agent
+sudo journalctl -u roc-robot-agent -f
 
 Binding rule
 The SDK package can be copied, but the binding command belongs to one robot registration record.
@@ -57,5 +62,5 @@ The sdkBindingToken is valid for 10 minutes and becomes invalid immediately afte
 
 Success signal
 For registration, the server response should contain signatureVerified=true, bindingStatus=BOUND or MATCHED, and reportId.
-For heartbeat, the log should periodically print Heartbeat verified.
+For heartbeat, sudo journalctl -u roc-robot-agent -f should periodically print Heartbeat verified.
 For stage verification, the server response should contain status=PASSED and signatureVerified=true.

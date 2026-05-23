@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SDK_VERSION="0.5.0-agent-heartbeat"
+SDK_VERSION="0.6.0-systemd-agent"
 DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://172.16.18.187:8090}"
 if [ "$#" -lt 1 ]; then
   printf 'Usage:\n' >&2
@@ -10,6 +10,7 @@ if [ "$#" -lt 1 ]; then
   printf '  Legacy:   %s <robotId> <ownerUserId> <serverUrl> <sdkBindingToken> [tpmHandle]\n' "$0" >&2
   printf '  Stage:    %s stage <serverUrl> <verificationId> <orderId> <taskId> <robotId> <stage> <nonce> <challengePayload> [tpmHandle]\n' "$0" >&2
   printf '  Agent:    %s agent <robotId> [serverUrl] [tpmHandle]\n' "$0" >&2
+  printf '  Service:  %s service <robotId> [serverUrl] [tpmHandle]\n' "$0" >&2
   exit 1
 fi
 
@@ -53,9 +54,9 @@ elif [ "$MODE" = "stage" ]; then
   OWNER_USER_ID=""
   SDK_BINDING_TOKEN=""
   AUTO_START_AGENT=0
-elif [ "$MODE" = "agent" ]; then
+elif [ "$MODE" = "agent" ] || [ "$MODE" = "service" ]; then
   if [ "$#" -lt 2 ]; then
-    printf 'Usage: %s agent <robotId> [serverUrl] [tpmHandle]\n' "$0" >&2
+    printf 'Usage: %s %s <robotId> [serverUrl] [tpmHandle]\n' "$0" "$MODE" >&2
     exit 1
   fi
   ROBOT_ID="$2"
@@ -286,12 +287,16 @@ JSON
   fi
 }
 
-if [ "$MODE" = "agent" ]; then
+if [ "$MODE" = "agent" ] || [ "$MODE" = "service" ]; then
   log "Starting DeRAS SDK agent for robot $ROBOT_ID"
   log "TPM public key fingerprint: $PUBLIC_KEY_FINGERPRINT"
   log "Server: $SERVER_URL"
   log "Heartbeat interval: ${ROC_HEARTBEAT_INTERVAL_SECONDS:-30}s"
-  log "Press Ctrl+C to stop."
+  if [ "$MODE" = "agent" ]; then
+    log "Press Ctrl+C to stop."
+  else
+    log "Running as systemd service."
+  fi
   LAST_HEARTBEAT_TS=0
   while true; do
     NOW_TS="$(date +%s)"
@@ -420,9 +425,9 @@ if [ "$AUTO_START_AGENT" = "1" ]; then
     exit 0
   fi
   log "Binding finished. robotId=$ROBOT_ID reportId=${REPORT_ID:-unknown}"
-  log "Starting DeRAS SDK agent automatically. Keep this terminal running."
-  log "If you want it to run after reboot, create a systemd service later."
-  exec "$0" agent "$ROBOT_ID" "$SERVER_URL" "$TPM_HANDLE"
+  log "Binding finished. The installer will start the background service."
+  log "Done."
+  exit 0
 fi
 
 log "Done."

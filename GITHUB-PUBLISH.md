@@ -42,7 +42,15 @@ The user only needs to SSH into the robot industrial PC and run the command gene
 curl -fsSL https://raw.githubusercontent.com/robocoin-service/roc-robot-sdk/main/install.sh | bash -s -- <sdkBindingToken>
 ```
 
-The binding token identifies the robot registration record. The SDK reads the TPM public key, asks the TPM private key to sign the binding payload, submits it to the server, then starts the DeRAS Agent.
+The binding token identifies the robot registration record. The SDK reads the TPM public key, asks the TPM private key to sign the binding payload, submits it to the server, then installs and starts the `roc-robot-agent` systemd service.
+
+Service commands:
+
+```bash
+sudo systemctl status roc-robot-agent
+sudo systemctl restart roc-robot-agent
+sudo journalctl -u roc-robot-agent -f
+```
 
 ## Security rule
 
