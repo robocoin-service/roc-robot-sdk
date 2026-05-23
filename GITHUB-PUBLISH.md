@@ -53,6 +53,8 @@ sudo journalctl -u roc-robot-agent -f
 cd ~/roc-robot-sdk && ./roc-robot-tpm-sdk.sh doctor
 ```
 
+The installer runs `doctor` automatically after setup. The manual doctor command is for troubleshooting only.
+
 ## Security rule
 
 The GitHub SDK can be public. The secret part is not inside the SDK. The real binding is controlled by:

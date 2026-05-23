@@ -54,7 +54,7 @@ sudo systemctl status roc-robot-agent
 sudo systemctl restart roc-robot-agent
 sudo journalctl -u roc-robot-agent -f
 
-Doctor command
+Doctor command, normally only for troubleshooting because the installer runs doctor automatically
 cd ~/roc-robot-sdk && ./roc-robot-tpm-sdk.sh doctor
 
 Doctor output checks SDK version, service status, TPM access, backend connectivity, robotId, binding result, latest heartbeat and latest error.
