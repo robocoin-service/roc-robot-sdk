@@ -54,6 +54,11 @@ sudo systemctl status roc-robot-agent
 sudo systemctl restart roc-robot-agent
 sudo journalctl -u roc-robot-agent -f
 
+Doctor command
+cd ~/roc-robot-sdk && ./roc-robot-tpm-sdk.sh doctor
+
+Doctor output checks SDK version, service status, TPM access, backend connectivity, robotId, binding result, latest heartbeat and latest error.
+
 Binding rule
 The SDK package can be copied, but the binding command belongs to one robot registration record.
 After the first successful TPM signature verification, roc-server stores that TPM public key fingerprint on sys_rob.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SDK_VERSION="0.6.0-systemd-agent"
+SDK_VERSION="0.7.0-sdk-doctor"
 DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://172.16.18.187:8090}"
 DEFAULT_REPO_URL="${ROC_SDK_REPO_URL:-https://github.com/robocoin-service/roc-robot-sdk.git}"
 INSTALL_DIR="${ROC_SDK_INSTALL_DIR:-$HOME/roc-robot-sdk}"
@@ -164,6 +164,15 @@ SERVICE
   log "View logs: sudo journalctl -u $SERVICE_NAME -f"
 }
 
+run_doctor_summary() {
+  log "Running SDK doctor..."
+  if [ "$RUN_SERVICE_AS_ROOT" = "1" ] && require_cmd sudo; then
+    sudo env ROC_SDK_HOME="$SDK_HOME" "$INSTALL_DIR/roc-robot-tpm-sdk.sh" doctor "$SERVER_URL" || true
+    return 0
+  fi
+  "$INSTALL_DIR/roc-robot-tpm-sdk.sh" doctor "$SERVER_URL" || true
+}
+
 SDK_BINDING_TOKEN="${1:-}"
 SERVER_URL="$DEFAULT_SERVER_URL"
 
@@ -194,4 +203,5 @@ mkdir -p "$SDK_HOME"
 run_sdk_bind
 ROBOT_ID="$(read_robot_id)"
 install_systemd_service "$ROBOT_ID"
+run_doctor_summary
 log "Install complete. Return to the web page and refresh the robot list."

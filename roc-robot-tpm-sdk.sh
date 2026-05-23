@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SDK_VERSION="0.6.0-systemd-agent"
+SDK_VERSION="0.7.0-sdk-doctor"
 DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://172.16.18.187:8090}"
 if [ "$#" -lt 1 ]; then
   printf 'Usage:\n' >&2
@@ -11,11 +11,19 @@ if [ "$#" -lt 1 ]; then
   printf '  Stage:    %s stage <serverUrl> <verificationId> <orderId> <taskId> <robotId> <stage> <nonce> <challengePayload> [tpmHandle]\n' "$0" >&2
   printf '  Agent:    %s agent <robotId> [serverUrl] [tpmHandle]\n' "$0" >&2
   printf '  Service:  %s service <robotId> [serverUrl] [tpmHandle]\n' "$0" >&2
+  printf '  Doctor:   %s doctor [serverUrl] [tpmHandle]\n' "$0" >&2
   exit 1
 fi
 
 MODE="$1"
-if [ "$MODE" = "bind" ] || [ "$MODE" = "install" ]; then
+if [ "$MODE" = "doctor" ]; then
+  SERVER_URL="${2:-$DEFAULT_SERVER_URL}"
+  TPM_HANDLE="${3:-0x81010010}"
+  ROBOT_ID=""
+  OWNER_USER_ID=""
+  SDK_BINDING_TOKEN=""
+  AUTO_START_AGENT=0
+elif [ "$MODE" = "bind" ] || [ "$MODE" = "install" ]; then
   if [ "$#" -lt 2 ]; then
     printf 'Usage: %s bind <sdkBindingToken> [serverUrl] [tpmHandle]\n' "$0" >&2
     exit 1
@@ -120,27 +128,119 @@ read_cpu_value() {
   lscpu | awk -F: -v k="$key" '$1==k { sub(/^[ \t]+/, "", $2); print $2; exit }'
 }
 
-require_cmd tpm2_getcap
-require_cmd tpm2_createprimary
-require_cmd tpm2_create
-require_cmd tpm2_load
-require_cmd tpm2_readpublic
-require_cmd tpm2_sign
-require_cmd tpm2_evictcontrol
-require_cmd tpm2_createek
-require_cmd tpm2_getrandom
-require_cmd openssl
-require_cmd python3
-require_cmd curl
-require_cmd sha256sum
-require_cmd base64
-require_cmd lscpu
-require_cmd xxd
-if [ "$MODE" = "agent" ]; then
-  require_cmd sed
+doctor_line() {
+  local label="$1"
+  local status="$2"
+  local detail="$3"
+  printf '[ROC SDK DOCTOR] %-18s %-8s %s\n' "$label" "$status" "$detail"
+}
+
+run_doctor() {
+  local robot_id_file="$SDK_HOME/robot-id"
+  local robot_id="未绑定"
+  local service_status="unknown"
+  local tpm_status="不可访问"
+  local backend_status="不可访问"
+  local heartbeat_status="暂无记录"
+  local last_error="无"
+
+  printf '[ROC SDK DOCTOR] Version: %s\n' "$SDK_VERSION"
+  printf '[ROC SDK DOCTOR] Server: %s\n' "$SERVER_URL"
+  printf '[ROC SDK DOCTOR] SDK home: %s\n' "$SDK_HOME"
+  printf '[ROC SDK DOCTOR] Install dir: %s\n' "$(cd "$(dirname "$0")" >/dev/null 2>&1 && pwd || printf '.')"
+
+  if [ -f "$robot_id_file" ]; then
+    robot_id="$(tr -d '[:space:]' < "$robot_id_file")"
+  fi
+  doctor_line "Robot ID" "INFO" "$robot_id"
+
+  if command -v systemctl >/dev/null 2>&1; then
+    service_status="$(systemctl is-active roc-robot-agent 2>/dev/null || true)"
+    if [ "$service_status" = "active" ]; then
+      doctor_line "Service" "OK" "roc-robot-agent is active"
+    else
+      doctor_line "Service" "WARN" "roc-robot-agent is ${service_status:-not-found}"
+      last_error="服务未运行或未安装"
+    fi
+  else
+    doctor_line "Service" "WARN" "systemctl not available"
+  fi
+
+  if command -v tpm2_getcap >/dev/null 2>&1 && tpm2_getcap properties-fixed >/dev/null 2>&1; then
+    tpm_status="可访问"
+    doctor_line "TPM" "OK" "$tpm_status"
+  else
+    doctor_line "TPM" "FAIL" "当前用户无法访问TPM或缺少tpm2-tools"
+    last_error="TPM不可访问"
+  fi
+
+  if command -v curl >/dev/null 2>&1; then
+    if curl -sS -o /dev/null --connect-timeout 3 "${SERVER_URL%/}" >/dev/null 2>&1; then
+      backend_status="可访问"
+      doctor_line "Backend" "OK" "$backend_status"
+    else
+      doctor_line "Backend" "WARN" "无法访问 ${SERVER_URL%/}"
+      last_error="后端地址不可访问"
+    fi
+  else
+    doctor_line "Backend" "FAIL" "curl missing"
+    last_error="curl缺失"
+  fi
+
+  if [ -f "$OUTPUT_DIR/heartbeat-server-response.json" ]; then
+    if grep -q '"code":200' "$OUTPUT_DIR/heartbeat-server-response.json"; then
+      heartbeat_status="最近心跳成功"
+      doctor_line "Heartbeat" "OK" "$heartbeat_status"
+    else
+      heartbeat_status="最近心跳失败"
+      doctor_line "Heartbeat" "WARN" "$heartbeat_status"
+      last_error="$(head -c 240 "$OUTPUT_DIR/heartbeat-server-response.json" 2>/dev/null || printf '心跳失败')"
+    fi
+  else
+    doctor_line "Heartbeat" "WARN" "$heartbeat_status"
+  fi
+
+  if [ -f "$OUTPUT_DIR/server-response.json" ]; then
+    if grep -q '"signatureVerified":true' "$OUTPUT_DIR/server-response.json"; then
+      doctor_line "Binding" "OK" "绑定验签通过"
+    else
+      doctor_line "Binding" "WARN" "绑定响应存在，但未看到 signatureVerified=true"
+    fi
+  else
+    doctor_line "Binding" "WARN" "暂无绑定响应文件"
+  fi
+
+  doctor_line "Last Error" "INFO" "$last_error"
+}
+
+if [ "$MODE" != "doctor" ]; then
+  require_cmd tpm2_getcap
+  require_cmd tpm2_createprimary
+  require_cmd tpm2_create
+  require_cmd tpm2_load
+  require_cmd tpm2_readpublic
+  require_cmd tpm2_sign
+  require_cmd tpm2_evictcontrol
+  require_cmd tpm2_createek
+  require_cmd tpm2_getrandom
+  require_cmd openssl
+  require_cmd python3
+  require_cmd curl
+  require_cmd sha256sum
+  require_cmd base64
+  require_cmd lscpu
+  require_cmd xxd
+  if [ "$MODE" = "agent" ]; then
+    require_cmd sed
+  fi
 fi
 
 mkdir -p "$WORK_DIR" "$OUTPUT_DIR"
+
+if [ "$MODE" = "doctor" ]; then
+  run_doctor
+  exit 0
+fi
 
 PRIMARY_CTX="$WORK_DIR/primary.ctx"
 KEY_PUB="$WORK_DIR/robocoin-signing-key.pub"

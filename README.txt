@@ -17,3 +17,6 @@ Service commands:
 sudo systemctl status roc-robot-agent
 sudo systemctl restart roc-robot-agent
 sudo journalctl -u roc-robot-agent -f
+
+Diagnostics:
+cd ~/roc-robot-sdk && ./roc-robot-tpm-sdk.sh doctor
