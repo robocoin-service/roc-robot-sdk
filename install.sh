@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SDK_VERSION="0.8.0-resilient-installer"
+SDK_VERSION="0.10.0-go2-adaptive-installer"
 DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://172.16.18.187:8090}"
 DEFAULT_REPO_URL="${ROC_SDK_REPO_URL:-https://github.com/robocoin-service/roc-robot-sdk.git}"
 INSTALL_DIR="${ROC_SDK_INSTALL_DIR:-$HOME/roc-robot-sdk}"
@@ -102,53 +102,57 @@ apt_get_resilient() {
 
 install_dependencies_if_needed() {
   local missing=""
-  for cmd in git curl python3 openssl sha256sum base64 lscpu xxd tpm2_getcap tpm2_createprimary tpm2_create tpm2_load tpm2_readpublic tpm2_sign tpm2_evictcontrol tpm2_createek tpm2_getrandom; do
+  local missing_tpm=""
+  for cmd in git curl python3 openssl sha256sum base64 lscpu; do
     if ! require_cmd "$cmd"; then
       missing="$missing $cmd"
     fi
   done
+  for cmd in tpm2_getcap tpm2_createprimary tpm2_create tpm2_load tpm2_readpublic tpm2_sign tpm2_evictcontrol; do
+    if ! require_cmd "$cmd"; then
+      missing_tpm="$missing_tpm $cmd"
+    fi
+  done
 
   if [ -z "$missing" ]; then
+    if [ -n "$missing_tpm" ]; then
+      log "TPM commands missing:${missing_tpm}. Go2/software identity will be used when TPM is unavailable."
+    fi
     return 0
   fi
 
-  log "Missing commands:$missing"
+  log "Missing base commands:${missing:- none}"
+  log "Missing TPM commands:${missing_tpm:- none}"
   if [ "${ROC_SKIP_DEP_INSTALL:-0}" = "1" ]; then
     log "ROC_SKIP_DEP_INSTALL=1, dependency installation skipped."
-    exit 1
+    if [ -n "$missing" ]; then
+      exit 1
+    fi
+    return 0
   fi
 
   if require_cmd apt-get; then
-    log "Installing required packages with apt-get. Sudo password may be required."
+    log "Installing required base packages with apt-get. Sudo password may be required."
     apt_get_resilient update
-    apt_get_resilient install -y git curl python3 openssl coreutils util-linux xxd tpm2-tools psmisc
+    apt_get_resilient install -y git curl python3 openssl coreutils util-linux psmisc
+    if [ -n "$missing_tpm" ]; then
+      log "TPM commands are optional for Go2/software identity. Set ROC_INSTALL_TPM_TOOLS=1 if this machine should use TPM."
+      if [ "${ROC_INSTALL_TPM_TOOLS:-0}" = "1" ]; then
+        apt_get_resilient install -y tpm2-tools
+      fi
+    fi
     return 0
   fi
 
   log "Cannot install dependencies automatically on this Linux distribution."
-  log "Please install: git curl python3 openssl coreutils util-linux xxd tpm2-tools"
+  log "Please install: git curl python3 openssl coreutils util-linux"
   exit 1
 }
 
 run_sdk_bind() {
-  log "Binding TPM device..."
-  if tpm2_getcap properties-fixed >/dev/null 2>&1; then
-    RUN_SERVICE_AS_ROOT=0
-    "$INSTALL_DIR/roc-robot-tpm-sdk.sh" bind "$SDK_BINDING_TOKEN" "$SERVER_URL"
-    return 0
-  fi
-
-  if require_cmd sudo; then
-    log "Current user cannot access TPM directly. Running SDK binding with sudo."
-    log "Sudo password may be required. SDK files remain in: $INSTALL_DIR"
-    RUN_SERVICE_AS_ROOT=1
-    sudo env ROC_SDK_HOME="$SDK_HOME" "$INSTALL_DIR/roc-robot-tpm-sdk.sh" bind "$SDK_BINDING_TOKEN" "$SERVER_URL"
-    return 0
-  fi
-
-  log "Cannot access TPM device with current user, and sudo is not available."
-  log "Please add the user to TPM/tss group or run the SDK as root."
-  exit 1
+  log "Binding adaptive device identity..."
+  RUN_SERVICE_AS_ROOT=0
+  "$INSTALL_DIR/roc-robot-tpm-sdk.sh" bind "$SDK_BINDING_TOKEN" "$SERVER_URL"
 }
 
 read_robot_id() {
