@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SDK_VERSION="0.10.0-go2-software-signing"
+SDK_VERSION="0.11.0-go2-diagnostics"
 DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://172.16.18.187:8090}"
 MODE="${1:-}"
 SDK_HOME="${ROC_SDK_HOME:-$HOME/.roc-robot-sdk}"
+SERVICE_NAME="${ROC_SDK_SERVICE_NAME:-roc-robot-agent}"
 WORK_DIR="$SDK_HOME/tpm"
 OUTPUT_DIR="$SDK_HOME/output"
 mkdir -p "$WORK_DIR" "$OUTPUT_DIR"
@@ -29,6 +30,10 @@ case "$MODE" in
   doctor) SERVER_URL="${2:-$DEFAULT_SERVER_URL}"; TPM_HANDLE="${3:-0x81010010}"; ROBOT_ID=""; SDK_BINDING_TOKEN="" ;;
   *) echo "Usage: $0 bind <sdkBindingToken> [serverUrl] | service <robotId> [serverUrl] | agent <robotId> [serverUrl] | doctor [serverUrl]" >&2; exit 1 ;;
 esac
+
+if [ "$MODE" = "doctor" ] && [ -z "${2:-}" ] && [ -f "$SDK_HOME/server-url" ]; then
+  SERVER_URL="$(trim "$SDK_HOME/server-url")"
+fi
 
 collect(){
   COMPUTER_NAME="$(hostname 2>/dev/null || echo unknown)"
@@ -120,7 +125,50 @@ stage_report(){
 JSON
 }
 
-if [ "$MODE" = "doctor" ]; then echo "[ROC SDK DOCTOR] Version: $SDK_VERSION"; [ -f "$SDK_HOME/robot-id" ] && echo "[ROC SDK DOCTOR] Robot ID: $(cat "$SDK_HOME/robot-id")"; [ -f "$OUTPUT_DIR/heartbeat-server-response.json" ] && cat "$OUTPUT_DIR/heartbeat-server-response.json"; exit 0; fi
+doctor_summary(){
+  echo "[ROC SDK DOCTOR] Version: $SDK_VERSION"
+  echo "[ROC SDK DOCTOR] SDK home: $SDK_HOME"
+  echo "[ROC SDK DOCTOR] Server URL: $SERVER_URL"
+  [ -f "$SDK_HOME/robot-id" ] && echo "[ROC SDK DOCTOR] Robot ID: $(cat "$SDK_HOME/robot-id")" || echo "[ROC SDK DOCTOR] Robot ID: missing"
+  echo "[ROC SDK DOCTOR] Time: $(date 2>/dev/null || true)"
+  echo "[ROC SDK DOCTOR] Hostname: $(hostname 2>/dev/null || echo unknown)"
+  echo "[ROC SDK DOCTOR] Kernel: $(uname -a 2>/dev/null || true)"
+
+  if has_cmd ip; then
+    echo "[ROC SDK DOCTOR] Network interfaces:"
+    ip -br addr 2>/dev/null || true
+    echo "[ROC SDK DOCTOR] Default route:"
+    ip route show default 2>/dev/null || true
+  fi
+
+  echo "[ROC SDK DOCTOR] SDK processes:"
+  ps -ef 2>/dev/null | grep 'roc-robot-tpm-sdk.sh' | grep -v grep || true
+
+  if has_cmd systemctl && [ -d /run/systemd/system ]; then
+    echo "[ROC SDK DOCTOR] Service status: $SERVICE_NAME"
+    systemctl --no-pager --full status "$SERVICE_NAME" 2>/dev/null | sed -n '1,18p' || true
+  fi
+
+  echo "[ROC SDK DOCTOR] Identity files:"
+  ls -l "$WORK_DIR"/*signing*.pem "$WORK_DIR"/robocoin-signing-public.pem 2>/dev/null || true
+
+  echo "[ROC SDK DOCTOR] Last bind response:"
+  [ -f "$OUTPUT_DIR/server-response.json" ] && cat "$OUTPUT_DIR/server-response.json" || true
+  echo
+  echo "[ROC SDK DOCTOR] Last heartbeat response:"
+  [ -f "$OUTPUT_DIR/heartbeat-server-response.json" ] && cat "$OUTPUT_DIR/heartbeat-server-response.json" || true
+  echo
+  echo "[ROC SDK DOCTOR] Last stage response:"
+  [ -f "$OUTPUT_DIR/stage-server-response.json" ] && cat "$OUTPUT_DIR/stage-server-response.json" || true
+  echo
+
+  if [ -f "$SDK_HOME/agent.log" ]; then
+    echo "[ROC SDK DOCTOR] Last agent.log lines:"
+    tail -40 "$SDK_HOME/agent.log" || true
+  fi
+}
+
+if [ "$MODE" = "doctor" ]; then doctor_summary; exit 0; fi
 prepare
 
 if [ "$MODE" = "service" ] || [ "$MODE" = "agent" ]; then

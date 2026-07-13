@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SDK_VERSION="0.11.0-industrial-resilient-installer"
+SDK_VERSION="0.12.0-diagnostics-installer"
 DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://172.16.18.187:8090}"
 DEFAULT_REPO_URL="${ROC_SDK_REPO_URL:-https://github.com/robocoin-service/roc-robot-sdk.git}"
 INSTALL_DIR="${ROC_SDK_INSTALL_DIR:-$HOME/roc-robot-sdk}"
@@ -91,6 +91,72 @@ configure_identity_policy() {
   fi
 }
 
+parse_server_host_port() {
+  python3 - "$SERVER_URL" <<'PY'
+import sys
+from urllib.parse import urlparse
+
+u = urlparse(sys.argv[1])
+scheme = u.scheme or "http"
+host = u.hostname or ""
+port = u.port or (443 if scheme == "https" else 80)
+print(f"{host} {port}")
+PY
+}
+
+check_system_time() {
+  local year
+  year="$(date +%Y 2>/dev/null || echo 1970)"
+  if [ "$year" -lt 2024 ]; then
+    log "System time looks wrong: $(date 2>/dev/null || true)"
+    log "This often means the robot booted without RTC/NTP. Heartbeat logs and signature audit may be confusing."
+    if [ "${ROC_STRICT_TIME_CHECK:-0}" = "1" ]; then
+      log "ROC_STRICT_TIME_CHECK=1, stopping install until system time is fixed."
+      exit 1
+    fi
+  fi
+}
+
+wait_for_server_available() {
+  local host port waited timeout
+  read -r host port <<EOF_SERVER
+$(parse_server_host_port)
+EOF_SERVER
+  timeout="${ROC_SERVER_WAIT_SECONDS:-60}"
+  waited=0
+
+  if [ -z "$host" ]; then
+    log "Cannot parse server URL: $SERVER_URL"
+    exit 1
+  fi
+
+  log "Checking server connectivity: $host:$port"
+  while [ "$waited" -le "$timeout" ]; do
+    if python3 - "$host" "$port" <<'PY'
+import socket, sys
+host = sys.argv[1]
+port = int(sys.argv[2])
+try:
+    with socket.create_connection((host, port), timeout=3):
+        pass
+except Exception:
+    sys.exit(1)
+PY
+    then
+      log "Server TCP connectivity OK: $host:$port"
+      curl -fsS --connect-timeout 3 --max-time 5 "${SERVER_URL%/}/" >/dev/null 2>&1 || true
+      return 0
+    fi
+    sleep 5
+    waited=$((waited + 5))
+    log "Waiting for server ${host}:${port}... (${waited}/${timeout}s)"
+  done
+
+  log "Server is unreachable: $SERVER_URL"
+  log "Check robot network, PC IP, backend port, firewall, or pass the correct serverUrl as the second argument."
+  exit 1
+}
+
 wait_for_apt_locks() {
   if ! require_cmd fuser; then
     return 0
@@ -159,32 +225,35 @@ install_dependencies_if_needed() {
     fi
   done
 
-  if [ -z "$missing" ]; then
-    if [ -n "$missing_tpm" ]; then
-      log "TPM commands missing:${missing_tpm}. Go2/software identity will be used when TPM is unavailable."
-    fi
+  log "Missing base commands:${missing:- none}"
+  log "Missing TPM commands:${missing_tpm:- none}"
+  if [ -z "$missing" ] && [ -z "$missing_tpm" ]; then
     return 0
   fi
 
-  log "Missing base commands:${missing:- none}"
-  log "Missing TPM commands:${missing_tpm:- none}"
   if [ "${ROC_SKIP_DEP_INSTALL:-0}" = "1" ]; then
     log "ROC_SKIP_DEP_INSTALL=1, dependency installation skipped."
     if [ -n "$missing" ]; then
+      exit 1
+    fi
+    if [ -n "$missing_tpm" ] && [ "$SOFTWARE_IDENTITY_ENV" != "1" ]; then
       exit 1
     fi
     return 0
   fi
 
   if require_cmd apt-get; then
-    log "Installing required base packages with apt-get. Sudo password may be required."
-    apt_get_resilient update
-    apt_get_resilient install -y git curl python3 openssl ca-certificates coreutils util-linux iproute2 procps psmisc
+    if [ -n "$missing" ]; then
+      log "Installing required base packages with apt-get. Sudo password may be required."
+      apt_get_resilient update
+      apt_get_resilient install -y git curl python3 openssl ca-certificates coreutils util-linux iproute2 procps psmisc
+    fi
     if [ -n "$missing_tpm" ]; then
       if [ "$SOFTWARE_IDENTITY_ENV" = "1" ] && [ "${ROC_INSTALL_TPM_TOOLS:-0}" != "1" ]; then
         log "TPM commands are optional on detected Go2/software identity devices. Set ROC_INSTALL_TPM_TOOLS=1 to install them anyway."
       else
         log "Installing TPM tools for industrial identity."
+        [ -z "$missing" ] && apt_get_resilient update
         apt_get_resilient install -y tpm2-tools
       fi
     fi
@@ -248,21 +317,26 @@ install_systemd_service() {
 
   if ! require_cmd systemctl || [ ! -d /run/systemd/system ]; then
     log "systemd is not available. Starting Agent with nohup."
+    printf '%s\n' "$robot_id" > "$SDK_HOME/robot-id"
+    printf '%s\n' "$SERVER_URL" > "$SDK_HOME/server-url"
     rm -f "$SDK_HOME/output/heartbeat-server-response.json"
-    nohup env ROC_SDK_HOME="$SDK_HOME" ROC_ALLOW_SOFTWARE_IDENTITY="$SOFTWARE_IDENTITY_ENV" "$INSTALL_DIR/roc-robot-tpm-sdk.sh" agent "$robot_id" "$SERVER_URL" > "$SDK_HOME/agent.log" 2>&1 &
+    nohup env ROC_SDK_HOME="$SDK_HOME" ROC_SERVER_URL="$SERVER_URL" ROC_ALLOW_SOFTWARE_IDENTITY="$SOFTWARE_IDENTITY_ENV" "$INSTALL_DIR/roc-robot-tpm-sdk.sh" agent "$robot_id" "$SERVER_URL" > "$SDK_HOME/agent.log" 2>&1 &
     log "Agent started in background. Log: $SDK_HOME/agent.log"
     return 0
   fi
 
   if ! require_cmd sudo; then
     log "sudo is not available. Starting Agent with nohup."
+    printf '%s\n' "$robot_id" > "$SDK_HOME/robot-id"
+    printf '%s\n' "$SERVER_URL" > "$SDK_HOME/server-url"
     rm -f "$SDK_HOME/output/heartbeat-server-response.json"
-    nohup env ROC_SDK_HOME="$SDK_HOME" ROC_ALLOW_SOFTWARE_IDENTITY="$SOFTWARE_IDENTITY_ENV" "$INSTALL_DIR/roc-robot-tpm-sdk.sh" agent "$robot_id" "$SERVER_URL" > "$SDK_HOME/agent.log" 2>&1 &
+    nohup env ROC_SDK_HOME="$SDK_HOME" ROC_SERVER_URL="$SERVER_URL" ROC_ALLOW_SOFTWARE_IDENTITY="$SOFTWARE_IDENTITY_ENV" "$INSTALL_DIR/roc-robot-tpm-sdk.sh" agent "$robot_id" "$SERVER_URL" > "$SDK_HOME/agent.log" 2>&1 &
     log "Agent started in background. Log: $SDK_HOME/agent.log"
     return 0
   fi
 
   printf '%s\n' "$robot_id" > "$SDK_HOME/robot-id"
+  printf '%s\n' "$SERVER_URL" > "$SDK_HOME/server-url"
   rm -f "$SDK_HOME/output/heartbeat-server-response.json"
 
   log "Installing systemd service: $SERVICE_NAME.service"
@@ -271,18 +345,25 @@ install_systemd_service() {
 Description=RoboCoin DeRAS SDK Agent
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=12
 
 [Service]
 Type=simple
 User=$service_user
 WorkingDirectory=$INSTALL_DIR
 Environment=ROC_SDK_HOME=$SDK_HOME
+Environment=ROC_SERVER_URL=$SERVER_URL
 Environment=ROC_ALLOW_SOFTWARE_IDENTITY=$SOFTWARE_IDENTITY_ENV
 Environment=ROC_HEARTBEAT_INTERVAL_SECONDS=${ROC_HEARTBEAT_INTERVAL_SECONDS:-30}
 Environment=ROC_AGENT_INTERVAL_SECONDS=${ROC_AGENT_INTERVAL_SECONDS:-3}
 ExecStart=$INSTALL_DIR/roc-robot-tpm-sdk.sh service $robot_id $SERVER_URL
 Restart=always
 RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -352,6 +433,8 @@ log "Device profile: $DEVICE_PROFILE"
 
 configure_identity_policy
 install_dependencies_if_needed
+check_system_time
+wait_for_server_available
 stop_existing_agent
 
 if [ -d "$INSTALL_DIR/.git" ]; then
