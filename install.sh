@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SDK_VERSION="0.10.0-go2-adaptive-installer"
+SDK_VERSION="0.11.0-industrial-resilient-installer"
 DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://172.16.18.187:8090}"
 DEFAULT_REPO_URL="${ROC_SDK_REPO_URL:-https://github.com/robocoin-service/roc-robot-sdk.git}"
 INSTALL_DIR="${ROC_SDK_INSTALL_DIR:-$HOME/roc-robot-sdk}"
 SDK_HOME="${ROC_SDK_HOME:-$HOME/.roc-robot-sdk}"
 SERVICE_NAME="${ROC_SDK_SERVICE_NAME:-roc-robot-agent}"
+DEVICE_PROFILE="${ROC_DEVICE_PROFILE:-auto}"
 RUN_SERVICE_AS_ROOT=0
+SOFTWARE_IDENTITY_ENV="${ROC_ALLOW_SOFTWARE_IDENTITY:-}"
 
 usage() {
   cat >&2 <<EOF
 ROC Robot SDK installer
 
 Usage:
-  bash install.sh <sdkBindingToken>
+  bash install.sh <sdkBindingToken> [serverUrl]
 
 Example:
   bash install.sh abc123
@@ -24,6 +26,9 @@ Environment:
   ROC_SDK_INSTALL_DIR    Install directory. Default: $INSTALL_DIR
   ROC_SDK_HOME           SDK runtime directory. Default: $SDK_HOME
   ROC_SKIP_DEP_INSTALL   Set to 1 to skip dependency installation.
+  ROC_DEVICE_PROFILE     auto | go2 | industrial. Default: auto.
+  ROC_ALLOW_SOFTWARE_IDENTITY
+                         Set to 1 to allow software RSA fallback explicitly.
 EOF
 }
 
@@ -43,6 +48,46 @@ sudo_cmd() {
     "$@"
   else
     sudo "$@"
+  fi
+}
+
+detect_go2_or_orin() {
+  case "$DEVICE_PROFILE" in
+    go2|GO2|unitree|UNITREE)
+      return 0
+      ;;
+    industrial|INDUSTRIAL|ipc|IPC)
+      return 1
+      ;;
+  esac
+
+  if [ -r /proc/device-tree/model ] && tr -d '\000' </proc/device-tree/model | grep -Eiq 'unitree|go2|orin|jetson|nvidia'; then
+    return 0
+  fi
+  if [ -d "$HOME/unitree_sdk2" ] || [ -d "$HOME/Downloads/sdk/unitree_sdk2" ] || [ -d /opt/unitree_sdk2 ]; then
+    return 0
+  fi
+  if require_cmd ip && ip -br addr 2>/dev/null | grep -q '192\.168\.123\.'; then
+    return 0
+  fi
+  if [ -n "$(find /sys/devices/platform -maxdepth 3 \( -name ecid -o -name public_key \) 2>/dev/null | head -n 1)" ]; then
+    return 0
+  fi
+  return 1
+}
+
+configure_identity_policy() {
+  if [ -n "$SOFTWARE_IDENTITY_ENV" ]; then
+    log "Software identity override: ROC_ALLOW_SOFTWARE_IDENTITY=$SOFTWARE_IDENTITY_ENV"
+    return 0
+  fi
+
+  if detect_go2_or_orin; then
+    SOFTWARE_IDENTITY_ENV=1
+    log "Detected Go2/Orin-like device. Software RSA identity fallback is enabled."
+  else
+    SOFTWARE_IDENTITY_ENV=0
+    log "Industrial profile detected. TPM identity is required unless ROC_ALLOW_SOFTWARE_IDENTITY=1 is set."
   fi
 }
 
@@ -134,10 +179,12 @@ install_dependencies_if_needed() {
   if require_cmd apt-get; then
     log "Installing required base packages with apt-get. Sudo password may be required."
     apt_get_resilient update
-    apt_get_resilient install -y git curl python3 openssl coreutils util-linux psmisc
+    apt_get_resilient install -y git curl python3 openssl ca-certificates coreutils util-linux iproute2 procps psmisc
     if [ -n "$missing_tpm" ]; then
-      log "TPM commands are optional for Go2/software identity. Set ROC_INSTALL_TPM_TOOLS=1 if this machine should use TPM."
-      if [ "${ROC_INSTALL_TPM_TOOLS:-0}" = "1" ]; then
+      if [ "$SOFTWARE_IDENTITY_ENV" = "1" ] && [ "${ROC_INSTALL_TPM_TOOLS:-0}" != "1" ]; then
+        log "TPM commands are optional on detected Go2/software identity devices. Set ROC_INSTALL_TPM_TOOLS=1 to install them anyway."
+      else
+        log "Installing TPM tools for industrial identity."
         apt_get_resilient install -y tpm2-tools
       fi
     fi
@@ -152,7 +199,19 @@ install_dependencies_if_needed() {
 run_sdk_bind() {
   log "Binding adaptive device identity..."
   RUN_SERVICE_AS_ROOT=0
-  "$INSTALL_DIR/roc-robot-tpm-sdk.sh" bind "$SDK_BINDING_TOKEN" "$SERVER_URL"
+  ROC_ALLOW_SOFTWARE_IDENTITY="$SOFTWARE_IDENTITY_ENV" "$INSTALL_DIR/roc-robot-tpm-sdk.sh" bind "$SDK_BINDING_TOKEN" "$SERVER_URL"
+}
+
+stop_existing_agent() {
+  log "Stopping existing SDK agent/service if present..."
+  if require_cmd systemctl && [ -d /run/systemd/system ] && require_cmd sudo; then
+    sudo systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+    sudo systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+  fi
+  if require_cmd pkill; then
+    pkill -f 'roc-robot-tpm-sdk\.sh service' >/dev/null 2>&1 || true
+    pkill -f 'roc-robot-tpm-sdk\.sh agent' >/dev/null 2>&1 || true
+  fi
 }
 
 read_robot_id() {
@@ -188,17 +247,23 @@ install_systemd_service() {
   fi
 
   if ! require_cmd systemctl || [ ! -d /run/systemd/system ]; then
-    log "systemd is not available. Start Agent manually:"
-    log "cd $INSTALL_DIR && ./roc-robot-tpm-sdk.sh agent $robot_id $SERVER_URL"
+    log "systemd is not available. Starting Agent with nohup."
+    rm -f "$SDK_HOME/output/heartbeat-server-response.json"
+    nohup env ROC_SDK_HOME="$SDK_HOME" ROC_ALLOW_SOFTWARE_IDENTITY="$SOFTWARE_IDENTITY_ENV" "$INSTALL_DIR/roc-robot-tpm-sdk.sh" agent "$robot_id" "$SERVER_URL" > "$SDK_HOME/agent.log" 2>&1 &
+    log "Agent started in background. Log: $SDK_HOME/agent.log"
     return 0
   fi
 
   if ! require_cmd sudo; then
-    log "sudo is required to install systemd service."
-    log "Start Agent manually instead:"
-    log "cd $INSTALL_DIR && ./roc-robot-tpm-sdk.sh agent $robot_id $SERVER_URL"
+    log "sudo is not available. Starting Agent with nohup."
+    rm -f "$SDK_HOME/output/heartbeat-server-response.json"
+    nohup env ROC_SDK_HOME="$SDK_HOME" ROC_ALLOW_SOFTWARE_IDENTITY="$SOFTWARE_IDENTITY_ENV" "$INSTALL_DIR/roc-robot-tpm-sdk.sh" agent "$robot_id" "$SERVER_URL" > "$SDK_HOME/agent.log" 2>&1 &
+    log "Agent started in background. Log: $SDK_HOME/agent.log"
     return 0
   fi
+
+  printf '%s\n' "$robot_id" > "$SDK_HOME/robot-id"
+  rm -f "$SDK_HOME/output/heartbeat-server-response.json"
 
   log "Installing systemd service: $SERVICE_NAME.service"
   sudo tee "/etc/systemd/system/$SERVICE_NAME.service" >/dev/null <<SERVICE
@@ -212,6 +277,7 @@ Type=simple
 User=$service_user
 WorkingDirectory=$INSTALL_DIR
 Environment=ROC_SDK_HOME=$SDK_HOME
+Environment=ROC_ALLOW_SOFTWARE_IDENTITY=$SOFTWARE_IDENTITY_ENV
 Environment=ROC_HEARTBEAT_INTERVAL_SECONDS=${ROC_HEARTBEAT_INTERVAL_SECONDS:-30}
 Environment=ROC_AGENT_INTERVAL_SECONDS=${ROC_AGENT_INTERVAL_SECONDS:-3}
 ExecStart=$INSTALL_DIR/roc-robot-tpm-sdk.sh service $robot_id $SERVER_URL
@@ -239,8 +305,39 @@ run_doctor_summary() {
   "$INSTALL_DIR/roc-robot-tpm-sdk.sh" doctor "$SERVER_URL" || true
 }
 
+wait_for_heartbeat_verified() {
+  local robot_id="$1"
+  local timeout="${ROC_INSTALL_HEARTBEAT_WAIT_SECONDS:-90}"
+  local waited=0
+  local response_file="$SDK_HOME/output/heartbeat-server-response.json"
+
+  log "Waiting for verified heartbeat robotId=$robot_id (${timeout}s timeout)..."
+  while [ "$waited" -le "$timeout" ]; do
+    if [ -f "$response_file" ] &&
+      grep -q '"code":200' "$response_file" 2>/dev/null &&
+      grep -Eq "\"robotId\"[[:space:]]*:[[:space:]]*$robot_id" "$response_file" 2>/dev/null; then
+      log "Heartbeat verified by server."
+      return 0
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+
+  log "Heartbeat was not verified within ${timeout}s."
+  log "Last heartbeat response:"
+  if [ -f "$response_file" ]; then
+    sed -n '1,5p' "$response_file"
+  else
+    log "No heartbeat response file found at $response_file"
+  fi
+  if require_cmd systemctl && [ -d /run/systemd/system ] && require_cmd sudo; then
+    sudo systemctl --no-pager --full status "$SERVICE_NAME" || true
+  fi
+  exit 1
+}
+
 SDK_BINDING_TOKEN="${1:-}"
-SERVER_URL="$DEFAULT_SERVER_URL"
+SERVER_URL="${2:-$DEFAULT_SERVER_URL}"
 
 if [ -z "$SDK_BINDING_TOKEN" ] || [ "$SDK_BINDING_TOKEN" = "-h" ] || [ "$SDK_BINDING_TOKEN" = "--help" ]; then
   usage
@@ -251,8 +348,11 @@ log "Version: $SDK_VERSION"
 log "Server: $SERVER_URL"
 log "Install directory: $INSTALL_DIR"
 log "SDK home: $SDK_HOME"
+log "Device profile: $DEVICE_PROFILE"
 
+configure_identity_policy
 install_dependencies_if_needed
+stop_existing_agent
 
 if [ -d "$INSTALL_DIR/.git" ]; then
   log "SDK directory exists. Pulling latest version..."
@@ -276,4 +376,5 @@ run_sdk_bind
 ROBOT_ID="$(read_robot_id)"
 install_systemd_service "$ROBOT_ID"
 run_doctor_summary
+wait_for_heartbeat_verified "$ROBOT_ID"
 log "Install complete. Return to the web page and refresh the robot list."
