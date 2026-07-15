@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import logging
+import math
+import os
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='[Go2 Bridge] %(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger('go2_bridge')
+
+parser = argparse.ArgumentParser(description='Unitree Go2 & DeRAS SDK Local Bridge')
+parser.add_argument('--server', type=str, default='http://172.16.18.187:8090', help='Real DeRAS Server URL')
+parser.add_argument('--host', type=str, default='0.0.0.0', help='Bridge listen host')
+parser.add_argument('--port', type=int, default=8080, help='Bridge listen port')
+parser.add_argument('--mock', action='store_true', default=False, help='Enable mock mode')
+parser.add_argument('--network', type=str, default='eth0', help='Network interface connected to Go2')
+args, unknown = parser.parse_known_args()
+
+REAL_SERVER_URL = args.server.rstrip('/')
+NETWORK_INTERFACE = args.network
+TINY_MOVE_BIN = '/home/unitree/go2_tiny_move/build/go2_tiny_move'
+TINY_MOVE_LD = '/home/unitree/Downloads/sdk/unitree_sdk2/thirdparty/lib/aarch64:/home/unitree/Downloads/sdk/unitree_sdk2/lib/aarch64'
+
+
+class RobotExecutor:
+    def __init__(self, mock=False):
+        self.mock = mock
+        self.state = 'IDLE'
+        self.error_msg = ''
+        self.current_pose = {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
+        self.target_pose = None
+        self.battery = 100
+        self.sport_client = None
+        self.sdk2_initialized = False
+        if not self.mock:
+            self._init_unitree_sdk2()
+
+    def _init_unitree_sdk2(self):
+        try:
+            logger.info('Initializing unitree_sdk2py on interface: %s', NETWORK_INTERFACE)
+            from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+            from unitree_sdk2py.go2.sport.sport_client import SportClient
+            ChannelFactoryInitialize(0, NETWORK_INTERFACE)
+            self.sport_client = SportClient()
+            self.sport_client.SetTimeout(10.0)
+            self.sport_client.Init()
+            self.sdk2_initialized = True
+            logger.info('Unitree SportClient initialized')
+        except Exception as exc:
+            self.sdk2_initialized = False
+            self.error_msg = 'Unitree SDK init failed: %s' % exc
+            logger.exception(self.error_msg)
+
+    def _call_sport_method(self, names):
+        for name in names:
+            method = getattr(self.sport_client, name, None)
+            if callable(method):
+                logger.info('Calling SportClient.%s()', name)
+                return method()
+        raise AttributeError('None of SportClient methods exist: %s' % names)
+
+    def _call_sport_method_isolated(self, names, tolerate_sigsegv=False):
+        script = """
+import json
+import os
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+from unitree_sdk2py.go2.sport.sport_client import SportClient
+network = os.environ.get('ROC_GO2_NETWORK', 'eth0')
+names = json.loads(os.environ.get('ROC_GO2_METHODS', '[]'))
+ChannelFactoryInitialize(0, network)
+client = SportClient()
+client.SetTimeout(10.0)
+client.Init()
+for name in names:
+    method = getattr(client, name, None)
+    if callable(method):
+        print('Calling SportClient.%s()' % name, flush=True)
+        method()
+        print('DONE', flush=True)
+        break
+else:
+    raise AttributeError('None of SportClient methods exist: %s' % names)
+"""
+        env = dict(os.environ)
+        env['ROC_GO2_NETWORK'] = NETWORK_INTERFACE
+        env['ROC_GO2_METHODS'] = json.dumps(names)
+        result = subprocess.run([sys.executable, '-c', script], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, timeout=20)
+        if result.returncode == 0:
+            return result.stdout
+        if tolerate_sigsegv and result.returncode == -11:
+            logger.warning('SportClient method process crashed with SIGSEGV after dispatch: %s', result.stdout)
+            return result.stdout + '\nSportClient process crashed with SIGSEGV after dispatch.'
+        raise RuntimeError('SportClient method process failed rc=%s output=%s' % (result.returncode, result.stdout))
+
+    def _run_tiny_motion(self, vx, vy, vyaw, duration_ms):
+        env = dict(os.environ)
+        env['LD_LIBRARY_PATH'] = TINY_MOVE_LD
+        cmd = [TINY_MOVE_BIN, NETWORK_INTERFACE, str(vx), str(vy), str(vyaw), str(int(duration_ms))]
+        logger.info('Running verified C++ motion helper: %s', ' '.join(cmd))
+        result = subprocess.run(
+            cmd, cwd='/home/unitree/go2_tiny_move', env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=max(8, int(duration_ms / 1000) + 5)
+        )
+        if result.returncode != 0:
+            raise RuntimeError('go2_tiny_move failed rc=%s output=%s' % (result.returncode, result.stdout))
+        return result.stdout
+
+    def _stop_sport_motion(self):
+        if not self.mock:
+            return self._run_tiny_motion(0.0, 0.0, 0.0, 0)
+
+    def _run_patrol_inspection(self, distance, turn_seconds):
+        try:
+            self.state = 'ACTION_RUNNING'
+            self.error_msg = ''
+            speed = 0.30
+            duration_ms = int(max(0.5, min(float(distance or 10.0), 20.0)) / speed * 1000)
+            turn_ms = int(max(1.0, min(float(turn_seconds or 9.0), 12.0)) * 1000)
+            self._run_tiny_motion(speed, 0.0, 0.0, duration_ms)
+            time.sleep(0.5)
+            self._run_tiny_motion(0.0, 0.0, 0.8, turn_ms)
+            time.sleep(0.5)
+            self._run_tiny_motion(speed, 0.0, 0.0, duration_ms)
+            self.state = 'ACTION_DONE'
+        except Exception as exc:
+            self.state = 'ERROR'
+            self.error_msg = 'Go2 patrol inspection failed: %s' % exc
+            logger.exception(self.error_msg)
+            try:
+                self._stop_sport_motion()
+            except Exception:
+                pass
+
+    def execute_action(self, action, meters=None, seconds=None, yaw_rate=None):
+        action_key = (action or '').strip().upper()
+        supported = {
+            'DANCE': 'dance1',
+            'DANCE_1': 'dance1',
+            'DANCE1': 'dance1',
+            'DANCE_2': 'dance2',
+            'DANCE2': 'dance2',
+            'MOVE_FORWARD': 'move_forward',
+            'FORWARD': 'move_forward',
+            'MOVE_BACKWARD': 'move_backward',
+            'BACKWARD': 'move_backward',
+            'TURN_AROUND': 'turn_around',
+            'STOP': 'stop',
+            'DAMP': 'stop',
+            'STAND_UP': 'stand_up',
+            'STAND': 'stand_up',
+            'HEART': 'heart',
+            'LOVE': 'heart',
+            'PATROL_INSPECTION': 'patrol_inspection',
+            'INSPECTION_PATROL': 'patrol_inspection',
+        }
+        normalized = supported.get(action_key)
+        if not normalized:
+            return {'code': 400, 'message': 'Unsupported Go2 action: %s' % action}
+
+        self.state = 'ACTION_RUNNING'
+        self.error_msg = ''
+        logger.info('Executing action=%s meters=%s seconds=%s yawRate=%s', normalized, meters, seconds, yaw_rate)
+        try:
+            if self.mock:
+                if normalized == 'patrol_inspection':
+                    threading.Thread(target=self._run_patrol_inspection, args=(meters or 10.0, seconds or 9.0), daemon=True).start()
+                    return {'code': 200, 'message': 'Mock patrol inspection started', 'data': {'action': normalized}}
+                time.sleep(float(seconds or 2.0))
+                self.state = 'ACTION_DONE'
+                return {'code': 200, 'message': 'Mock action %s finished' % normalized, 'data': {'action': normalized}}
+
+            if normalized == 'patrol_inspection':
+                threading.Thread(target=self._run_patrol_inspection, args=(meters or 10.0, seconds or 9.0), daemon=True).start()
+                return {'code': 200, 'message': 'Go2 patrol inspection started', 'data': {'action': normalized, 'meters': meters or 10.0, 'turnSeconds': seconds or 9.0}}
+            if normalized == 'stop':
+                output = self._stop_sport_motion()
+            elif normalized in ('move_forward', 'move_backward'):
+                distance = max(0.1, min(float(meters or 1.0), 10.0))
+                speed = 0.18
+                duration_ms = int((float(seconds) * 1000) if seconds else (distance / speed * 1000))
+                duration_ms = max(100, min(duration_ms, 45000))
+                vx = speed if normalized == 'move_forward' else -speed
+                output = self._run_tiny_motion(vx, 0.0, 0.0, duration_ms)
+            elif normalized == 'turn_around':
+                rate = max(0.1, min(float(yaw_rate or 0.8), 0.8))
+                duration_ms = int((float(seconds) * 1000) if seconds else 4000)
+                duration_ms = max(100, min(duration_ms, 12000))
+                output = self._run_tiny_motion(0.0, 0.0, rate, duration_ms)
+            else:
+                if not self.sdk2_initialized or not self.sport_client:
+                    self.state = 'ERROR'
+                    self.error_msg = 'Unitree SportClient is not initialized'
+                    return {'code': 500, 'message': self.error_msg}
+                if normalized == 'stand_up':
+                    self._call_sport_method(['StandUp', 'Standup'])
+                elif normalized == 'dance1':
+                    self._call_sport_method(['Dance1'])
+                elif normalized == 'dance2':
+                    self._call_sport_method(['Dance2'])
+                elif normalized == 'heart':
+                    output = self._call_sport_method_isolated(['Heart', 'FingerHeart', 'FingerHeartGesture', 'Love'], tolerate_sigsegv=True)
+                output = ''
+
+            self.state = 'ACTION_DONE'
+            return {'code': 200, 'message': 'Go2 action %s finished' % normalized, 'data': {'action': normalized, 'output': output}}
+        except Exception as exc:
+            self.state = 'ERROR'
+            self.error_msg = 'Go2 action failed: %s' % exc
+            logger.exception(self.error_msg)
+            try:
+                self._stop_sport_motion()
+            except Exception:
+                pass
+            return {'code': 500, 'message': self.error_msg}
+
+    def status(self):
+        return {
+            'status': self.state,
+            'current_pose': self.current_pose,
+            'target_pose': self.target_pose,
+            'battery': self.battery,
+            'sdk2_initialized': self.sdk2_initialized,
+            'error': self.error_msg,
+        }
+
+
+executor = RobotExecutor(mock=args.mock)
+
+
+def json_bytes(payload):
+    return json.dumps(payload, ensure_ascii=False).encode('utf-8')
+
+
+class BridgeHandler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, fmt, *args):
+        logger.info('%s - %s', self.client_address[0], fmt % args)
+
+    def _send_json(self, payload, status=200):
+        body = json_bytes(payload)
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json(self):
+        length = int(self.headers.get('Content-Length') or 0)
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        if not raw:
+            return {}
+        return json.loads(raw.decode('utf-8'))
+
+    def do_GET(self):
+        parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path == '/api/v1/status':
+            self._send_json(executor.status())
+            return
+        self._proxy()
+
+    def do_POST(self):
+        parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path == '/api/v1/action':
+            try:
+                payload = self._read_json()
+                result = executor.execute_action(
+                    payload.get('action'),
+                    meters=payload.get('meters'),
+                    seconds=payload.get('seconds'),
+                    yaw_rate=payload.get('yawRate'),
+                )
+                self._send_json(result, 200 if result.get('code') == 200 else 500)
+            except Exception as exc:
+                logger.exception('Action request failed')
+                self._send_json({'code': 500, 'message': str(exc)}, 500)
+            return
+        if parsed.path == '/api/v1/cancel':
+            executor.execute_action('STOP')
+            self._send_json({'code': 200, 'message': 'Task cancelled and robot stopped'})
+            return
+        self._proxy()
+
+    def do_PUT(self):
+        self._proxy()
+
+    def do_DELETE(self):
+        self._proxy()
+
+    def _proxy(self):
+        length = int(self.headers.get('Content-Length') or 0)
+        body = self.rfile.read(length) if length else None
+        target = REAL_SERVER_URL + self.path
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in ('host', 'content-length', 'connection')}
+        req = urllib.request.Request(target, data=body, headers=headers, method=self.command)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = resp.read()
+                self.send_response(resp.getcode())
+                content_type = resp.headers.get('Content-Type', 'application/json; charset=utf-8')
+                self.send_header('Content-Type', content_type)
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+        except urllib.error.HTTPError as exc:
+            data = exc.read()
+            self.send_response(exc.code)
+            self.send_header('Content-Type', exc.headers.get('Content-Type', 'application/json; charset=utf-8'))
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as exc:
+            logger.exception('Proxy failed: %s', target)
+            self._send_json({'code': 502, 'message': 'DeRAS Server unreachable: %s' % exc}, 502)
+
+
+if __name__ == '__main__':
+    server = ThreadingHTTPServer((args.host, args.port), BridgeHandler)
+    logger.info('Go2 bridge listening on %s:%s, proxy=%s, network=%s', args.host, args.port, REAL_SERVER_URL, NETWORK_INTERFACE)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info('Go2 bridge stopped')

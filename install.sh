@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SDK_VERSION="0.12.0-diagnostics-installer"
+SDK_VERSION="0.13.0-go2-bridge-safe-installer"
 DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://172.16.18.187:8090}"
 DEFAULT_REPO_URL="${ROC_SDK_REPO_URL:-https://github.com/robocoin-service/roc-robot-sdk.git}"
 INSTALL_DIR="${ROC_SDK_INSTALL_DIR:-$HOME/roc-robot-sdk}"
 SDK_HOME="${ROC_SDK_HOME:-$HOME/.roc-robot-sdk}"
 SERVICE_NAME="${ROC_SDK_SERVICE_NAME:-roc-robot-agent}"
 DEVICE_PROFILE="${ROC_DEVICE_PROFILE:-auto}"
+BRIDGE_SERVICE_NAME="${ROC_GO2_BRIDGE_SERVICE_NAME:-go2-bridge}"
 RUN_SERVICE_AS_ROOT=0
 SOFTWARE_IDENTITY_ENV="${ROC_ALLOW_SOFTWARE_IDENTITY:-}"
 
@@ -300,6 +301,56 @@ except Exception:
 '
 }
 
+backup_go2_bridge_if_present() {
+  mkdir -p "$SDK_HOME"
+  if [ -f "$INSTALL_DIR/go2_bridge.py" ]; then
+    cp "$INSTALL_DIR/go2_bridge.py" "$SDK_HOME/go2_bridge.py.pre-install-backup"
+    log "Existing Go2 bridge backed up before SDK refresh."
+  fi
+}
+
+restore_go2_bridge_if_needed() {
+  if [ -f "$SDK_HOME/go2_bridge.py.pre-install-backup" ]; then
+    cp "$SDK_HOME/go2_bridge.py.pre-install-backup" "$INSTALL_DIR/go2_bridge.py"
+    chmod +x "$INSTALL_DIR/go2_bridge.py" || true
+    log "Go2 bridge restored from pre-install backup."
+    return 0
+  fi
+  if [ -f "$INSTALL_DIR/go2_bridge.py" ]; then
+    chmod +x "$INSTALL_DIR/go2_bridge.py" || true
+    log "Go2 bridge present in SDK repository."
+    return 0
+  fi
+  return 1
+}
+
+repair_go2_bridge_service_if_present() {
+  if ! require_cmd systemctl || [ ! -d /run/systemd/system ]; then
+    return 0
+  fi
+  if [ ! -f "/etc/systemd/system/${BRIDGE_SERVICE_NAME}.service" ] && ! systemctl list-unit-files "${BRIDGE_SERVICE_NAME}.service" >/dev/null 2>&1; then
+    return 0
+  fi
+  log "Detected existing Go2 bridge service; ensuring bridge file and service health."
+  if ! restore_go2_bridge_if_needed; then
+    log "Warning: ${BRIDGE_SERVICE_NAME}.service exists but go2_bridge.py is missing. Install the Go2 integration package to restore physical action support."
+    return 0
+  fi
+  if require_cmd sudo; then
+    sudo systemctl daemon-reload || true
+    sudo systemctl restart "$BRIDGE_SERVICE_NAME" || true
+    for i in 1 2 3 4 5; do
+      if curl -fsS --connect-timeout 2 http://127.0.0.1:8080/api/v1/status >/dev/null 2>&1; then
+        log "Go2 bridge health check OK."
+        return 0
+      fi
+      sleep 2
+    done
+    log "Warning: Go2 bridge health check failed after restart. Recent logs:"
+    sudo journalctl -u "$BRIDGE_SERVICE_NAME" -n 80 --no-pager || true
+  fi
+}
+
 install_systemd_service() {
   local robot_id="$1"
   local current_user
@@ -436,6 +487,8 @@ install_dependencies_if_needed
 check_system_time
 wait_for_server_available
 stop_existing_agent
+mkdir -p "$SDK_HOME"
+backup_go2_bridge_if_present
 
 if [ -d "$INSTALL_DIR/.git" ]; then
   log "SDK directory exists. Pulling latest version..."
@@ -453,11 +506,13 @@ else
 fi
 
 chmod +x "$INSTALL_DIR/roc-robot-tpm-sdk.sh"
+restore_go2_bridge_if_needed || true
 
 mkdir -p "$SDK_HOME"
 run_sdk_bind
 ROBOT_ID="$(read_robot_id)"
 install_systemd_service "$ROBOT_ID"
+repair_go2_bridge_service_if_present
 run_doctor_summary
 wait_for_heartbeat_verified "$ROBOT_ID"
 log "Install complete. Return to the web page and refresh the robot list."
