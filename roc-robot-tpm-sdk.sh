@@ -51,7 +51,15 @@ collect(){
   ORIN_CUSTOMER_OPTIN_FUSE="$(sutrim /sys/devices/platform/efuse-burn/opt_customer_optin_fuse)"
   ORIN_PUBLIC_KEY_FINGERPRINT=""; [ -n "$ORIN_PUBLIC_KEY" ] && ORIN_PUBLIC_KEY_FINGERPRINT="$(sha "$ORIN_PUBLIC_KEY")"
   GO2_NETWORK_INTERFACE="${ROC_GO2_NETWORK_INTERFACE:-}"
-  [ -z "$GO2_NETWORK_INTERFACE" ] && has_cmd ip && GO2_NETWORK_INTERFACE="$(ip -br addr 2>/dev/null | awk '$3 ~ /^192\.168\.123\./ {print $1; exit}')"
+  if [ -z "$GO2_NETWORK_INTERFACE" ] && has_cmd ip; then
+    GO2_NETWORK_INTERFACE="$(ip -br addr 2>/dev/null | awk '$3 ~ /^192\.168\.123\./ {print $1; exit}')"
+  fi
+  if [ -z "$GO2_NETWORK_INTERFACE" ] && has_cmd ip; then
+    GO2_NETWORK_INTERFACE="$(ip -br link 2>/dev/null | awk '$1 == "wlan0" && $2 == "UP" {print $1; exit}')"
+  fi
+  if [ -z "$GO2_NETWORK_INTERFACE" ] && has_cmd ip; then
+    GO2_NETWORK_INTERFACE="$(ip route 2>/dev/null | awk '$1 == "default" {print $5; exit}')"
+  fi
   GO2_NETWORK_INTERFACE="${GO2_NETWORK_INTERFACE:-eth0}"
   UNITREE_SDK2_PATH=""; UNITREE_PYTHON_SDK_PATH=""
   for p in "$HOME/Downloads/sdk/unitree_sdk2" "$HOME/unitree_sdk2" "/opt/unitree_sdk2"; do [ -d "$p" ] && UNITREE_SDK2_PATH="$p" && break; done

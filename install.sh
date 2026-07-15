@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SDK_VERSION="0.13.0-go2-bridge-safe-installer"
+SDK_VERSION="0.14.0-wifi-bridge-installer"
 DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://172.16.18.187:8090}"
 DEFAULT_REPO_URL="${ROC_SDK_REPO_URL:-https://github.com/robocoin-service/roc-robot-sdk.git}"
 INSTALL_DIR="${ROC_SDK_INSTALL_DIR:-$HOME/roc-robot-sdk}"
@@ -284,6 +284,19 @@ stop_existing_agent() {
   fi
 }
 
+detect_go2_network_interface() {
+  local iface="${ROC_GO2_NETWORK_INTERFACE:-}"
+  if [ -z "$iface" ] && require_cmd ip; then
+    iface="$(ip -br addr 2>/dev/null | awk '$3 ~ /^192\.168\.123\./ {print $1; exit}')"
+  fi
+  if [ -z "$iface" ] && require_cmd ip; then
+    iface="$(ip -br link 2>/dev/null | awk '$1 == "wlan0" && $2 == "UP" {print $1; exit}')"
+  fi
+  if [ -z "$iface" ] && require_cmd ip; then
+    iface="$(ip route 2>/dev/null | awk '$1 == "default" {print $5; exit}')"
+  fi
+  printf '%s\n' "${iface:-eth0}"
+}
 read_robot_id() {
   local robot_id_file="$SDK_HOME/robot-id"
   if [ -f "$robot_id_file" ]; then
@@ -332,6 +345,12 @@ repair_go2_bridge_service_if_present() {
     return 0
   fi
   log "Detected existing Go2 bridge service; ensuring bridge file and service health."
+  local go2_network_interface
+  go2_network_interface="$(detect_go2_network_interface)"
+  log "Go2 bridge network interface: $go2_network_interface"
+  if require_cmd sudo && [ -f "/etc/systemd/system/${BRIDGE_SERVICE_NAME}.service" ]; then
+    sudo sed -i -E "s/--network[[:space:]]+[^[:space:]]+/--network ${go2_network_interface}/g" "/etc/systemd/system/${BRIDGE_SERVICE_NAME}.service" || true
+  fi
   if ! restore_go2_bridge_if_needed; then
     log "Warning: ${BRIDGE_SERVICE_NAME}.service exists but go2_bridge.py is missing. Install the Go2 integration package to restore physical action support."
     return 0

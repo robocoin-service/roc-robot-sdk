@@ -25,7 +25,7 @@ parser.add_argument('--server', type=str, default='http://172.16.18.187:8090', h
 parser.add_argument('--host', type=str, default='0.0.0.0', help='Bridge listen host')
 parser.add_argument('--port', type=int, default=8080, help='Bridge listen port')
 parser.add_argument('--mock', action='store_true', default=False, help='Enable mock mode')
-parser.add_argument('--network', type=str, default='eth0', help='Network interface connected to Go2')
+parser.add_argument('--network', type=str, default=os.environ.get('ROC_GO2_NETWORK', 'eth0'), help='Network interface connected to Go2')
 args, unknown = parser.parse_known_args()
 
 REAL_SERVER_URL = args.server.rstrip('/')
