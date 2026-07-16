@@ -156,7 +156,7 @@ int main(int argc, char **argv) {
     float vyaw = argc > 4 ? parse_float(argv[4], 0.0f) : 0.0f;
     int duration_ms = argc > 5 ? parse_int(argv[5], 0) : 0;
 
-    duration_ms = std::max(0, std::min(duration_ms, 45000));
+    duration_ms = std::max(0, std::min(duration_ms, 240000));
     vx = std::max(-0.40f, std::min(vx, 0.40f));
     vy = std::max(-0.30f, std::min(vy, 0.30f));
     vyaw = std::max(-0.90f, std::min(vyaw, 0.90f));

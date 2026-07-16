@@ -313,10 +313,10 @@ else:
             if normalized == 'stop':
                 output = self._stop_sport_motion()
             elif normalized in ('move_forward', 'move_backward'):
-                distance = max(0.1, min(float(meters or 1.0), 10.0))
-                speed = 0.18
+                distance = max(0.1, min(float(meters or 1.0), 60.0))
+                speed = 0.30 if distance > 10.0 else 0.18
                 duration_ms = int((float(seconds) * 1000) if seconds else (distance / speed * 1000))
-                duration_ms = max(100, min(duration_ms, 45000))
+                duration_ms = max(100, min(duration_ms, 240000))
                 vx = speed if normalized == 'move_forward' else -speed
                 output = self._run_tiny_motion(vx, 0.0, 0.0, duration_ms)
             elif normalized == 'turn_around':
