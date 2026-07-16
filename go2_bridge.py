@@ -32,6 +32,7 @@ REAL_SERVER_URL = args.server.rstrip('/')
 NETWORK_INTERFACE = args.network
 TINY_MOVE_BIN = '/home/unitree/go2_tiny_move/build/go2_tiny_move'
 TINY_MOVE_LD = '/home/unitree/Downloads/sdk/unitree_sdk2/thirdparty/lib/aarch64:/home/unitree/Downloads/sdk/unitree_sdk2/lib/aarch64'
+SDK_ACTION_HELPER_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'go2_helper', 'build', 'go2_action_helper')
 
 
 class RobotExecutor:
@@ -68,7 +69,11 @@ class RobotExecutor:
             method = getattr(self.sport_client, name, None)
             if callable(method):
                 logger.info('Calling SportClient.%s()', name)
-                return method()
+                code = method()
+                logger.info('SportClient.%s() returned code=%s', name, code)
+                if code not in (0, None):
+                    raise RuntimeError('SportClient.%s returned code=%s' % (name, code))
+                return code
         raise AttributeError('None of SportClient methods exist: %s' % names)
 
     def _call_sport_method_isolated(self, names, tolerate_sigsegv=False):
@@ -87,7 +92,10 @@ for name in names:
     method = getattr(client, name, None)
     if callable(method):
         print('Calling SportClient.%s()' % name, flush=True)
-        method()
+        code = method()
+        print('RESULT SportClient.%s code=%s' % (name, code), flush=True)
+        if code not in (0, None):
+            raise RuntimeError('SportClient.%s returned code=%s' % (name, code))
         print('DONE', flush=True)
         break
 else:
@@ -102,17 +110,52 @@ else:
         if result.returncode == 0:
             return result.stdout
         if tolerate_sigsegv and result.returncode == -11:
-            logger.warning('SportClient method process crashed with SIGSEGV after dispatch: %s', result.stdout)
-            return result.stdout + '\nSportClient process crashed with SIGSEGV after dispatch.'
+            raise RuntimeError('SportClient process crashed before action result: %s' % result.stdout)
         raise RuntimeError('SportClient method process failed rc=%s output=%s' % (result.returncode, result.stdout))
+
+    def _run_named_action(self, action):
+        helper = SDK_ACTION_HELPER_BIN if os.path.isfile(SDK_ACTION_HELPER_BIN) else TINY_MOVE_BIN
+        if not os.path.isfile(helper):
+            raise RuntimeError('Go2 C++ action helper is missing: %s' % helper)
+        env = dict(os.environ)
+        env['LD_LIBRARY_PATH'] = TINY_MOVE_LD
+
+        def run_once(named_action):
+            cmd = [helper, NETWORK_INTERFACE, named_action]
+            logger.info('Running verified C++ named action: %s', ' '.join(cmd))
+            return subprocess.run(
+                cmd, cwd=os.path.dirname(helper), env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30
+            )
+
+        if action in ('heart', 'dance1', 'dance2'):
+            stand_result = run_once('stand_up')
+            if stand_result.returncode == 0:
+                time.sleep(1.0)
+            else:
+                logger.warning('Go2 stand preflight failed before %s: %s', action, stand_result.stdout)
+
+        result = run_once(action)
+        if result.returncode != 0 and 'code=3104' in result.stdout and action in ('heart', 'dance1', 'dance2'):
+            logger.warning('Go2 action %s timed out; recovering stand state before one retry', action)
+            stand_result = run_once('stand_up')
+            if stand_result.returncode == 0:
+                time.sleep(1.5)
+                result = run_once(action)
+        if result.returncode != 0:
+            raise RuntimeError('Go2 named action failed rc=%s output=%s' % (result.returncode, result.stdout))
+        return result.stdout
 
     def _run_tiny_motion(self, vx, vy, vyaw, duration_ms):
         env = dict(os.environ)
         env['LD_LIBRARY_PATH'] = TINY_MOVE_LD
-        cmd = [TINY_MOVE_BIN, NETWORK_INTERFACE, str(vx), str(vy), str(vyaw), str(int(duration_ms))]
+        helper = SDK_ACTION_HELPER_BIN if os.path.isfile(SDK_ACTION_HELPER_BIN) else TINY_MOVE_BIN
+        if not os.path.isfile(helper):
+            raise RuntimeError('Go2 C++ action helper is missing: %s' % helper)
+        cmd = [helper, NETWORK_INTERFACE, str(vx), str(vy), str(vyaw), str(int(duration_ms))]
         logger.info('Running verified C++ motion helper: %s', ' '.join(cmd))
         result = subprocess.run(
-            cmd, cwd='/home/unitree/go2_tiny_move', env=env,
+            cmd, cwd=os.path.dirname(helper), env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=max(8, int(duration_ms / 1000) + 5)
         )
         if result.returncode != 0:
@@ -200,20 +243,10 @@ else:
                 duration_ms = int((float(seconds) * 1000) if seconds else 4000)
                 duration_ms = max(100, min(duration_ms, 12000))
                 output = self._run_tiny_motion(0.0, 0.0, rate, duration_ms)
+            elif normalized in ('stand_up', 'dance1', 'dance2', 'heart'):
+                output = self._run_named_action(normalized)
             else:
-                if not self.sdk2_initialized or not self.sport_client:
-                    self.state = 'ERROR'
-                    self.error_msg = 'Unitree SportClient is not initialized'
-                    return {'code': 500, 'message': self.error_msg}
-                if normalized == 'stand_up':
-                    self._call_sport_method(['StandUp', 'Standup'])
-                elif normalized == 'dance1':
-                    self._call_sport_method(['Dance1'])
-                elif normalized == 'dance2':
-                    self._call_sport_method(['Dance2'])
-                elif normalized == 'heart':
-                    output = self._call_sport_method_isolated(['Heart', 'FingerHeart', 'FingerHeartGesture', 'Love'], tolerate_sigsegv=True)
-                output = ''
+                raise RuntimeError('No executor configured for Go2 action: %s' % normalized)
 
             self.state = 'ACTION_DONE'
             return {'code': 200, 'message': 'Go2 action %s finished' % normalized, 'data': {'action': normalized, 'output': output}}
@@ -234,6 +267,8 @@ else:
             'target_pose': self.target_pose,
             'battery': self.battery,
             'sdk2_initialized': self.sdk2_initialized,
+            'network_interface': NETWORK_INTERFACE,
+            'action_helper_ready': os.path.isfile(SDK_ACTION_HELPER_BIN) or os.path.isfile(TINY_MOVE_BIN),
             'error': self.error_msg,
         }
 

@@ -20,3 +20,9 @@ sudo journalctl -u roc-robot-agent -f
 
 Diagnostics are run automatically at the end of install. Manual diagnostics for troubleshooting:
 cd ~/roc-robot-sdk && ./roc-robot-tpm-sdk.sh doctor
+
+Go2 network model:
+- The PC reaches the bridge through the robot WiFi address (for example, 172.16.x.x:8080).
+- On an onboard Go2/Orin computer, Unitree DDS actions use the internal 192.168.123.x interface, normally eth0.
+- The installer detects the route to the Go2 controller at 192.168.123.161 and builds the C++ action helper automatically.
+- Set ROC_GO2_NETWORK_INTERFACE only when automatic detection is not correct.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SDK_VERSION="0.14.0-wifi-bridge-installer"
+SDK_VERSION="0.15.0-go2-control-plane-fix"
 DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://172.16.18.187:8090}"
 DEFAULT_REPO_URL="${ROC_SDK_REPO_URL:-https://github.com/robocoin-service/roc-robot-sdk.git}"
 INSTALL_DIR="${ROC_SDK_INSTALL_DIR:-$HOME/roc-robot-sdk}"
@@ -287,6 +287,9 @@ stop_existing_agent() {
 detect_go2_network_interface() {
   local iface="${ROC_GO2_NETWORK_INTERFACE:-}"
   if [ -z "$iface" ] && require_cmd ip; then
+    iface="$(ip route get 192.168.123.161 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')"
+  fi
+  if [ -z "$iface" ] && require_cmd ip; then
     iface="$(ip -br addr 2>/dev/null | awk '$3 ~ /^192\.168\.123\./ {print $1; exit}')"
   fi
   if [ -z "$iface" ] && require_cmd ip; then
@@ -296,6 +299,49 @@ detect_go2_network_interface() {
     iface="$(ip route 2>/dev/null | awk '$1 == "default" {print $5; exit}')"
   fi
   printf '%s\n' "${iface:-eth0}"
+}
+
+find_unitree_sdk_dir() {
+  local candidate
+  for candidate in \
+    "${ROC_UNITREE_SDK_DIR:-}" \
+    "$HOME/Downloads/sdk/unitree_sdk2" \
+    "$HOME/unitree_sdk2" \
+    /opt/unitree_sdk2; do
+    if [ -n "$candidate" ] && [ -f "$candidate/include/unitree/robot/go2/sport/sport_client.hpp" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+build_go2_action_helper_if_possible() {
+  if ! detect_go2_or_orin || [ ! -f "$INSTALL_DIR/go2_helper/CMakeLists.txt" ]; then
+    return 0
+  fi
+
+  local sdk_dir
+  sdk_dir="$(find_unitree_sdk_dir || true)"
+  if [ -z "$sdk_dir" ]; then
+    log "Warning: Unitree SDK2 was not found; Go2 physical action helper was not built."
+    return 0
+  fi
+
+  if ! require_cmd cmake || ! require_cmd g++; then
+    if require_cmd apt-get && [ "${ROC_SKIP_DEP_INSTALL:-0}" != "1" ]; then
+      log "Installing Go2 action helper build dependencies."
+      apt_get_resilient update
+      apt_get_resilient install -y cmake g++ make
+    else
+      log "Warning: cmake/g++ missing; Go2 physical action helper was not built."
+      return 0
+    fi
+  fi
+
+  log "Building verified Go2 C++ action helper with SDK: $sdk_dir"
+  cmake -S "$INSTALL_DIR/go2_helper" -B "$INSTALL_DIR/go2_helper/build" -DUNITREE_SDK_DIR="$sdk_dir"
+  cmake --build "$INSTALL_DIR/go2_helper/build" --parallel 2
 }
 read_robot_id() {
   local robot_id_file="$SDK_HOME/robot-id"
@@ -323,15 +369,15 @@ backup_go2_bridge_if_present() {
 }
 
 restore_go2_bridge_if_needed() {
+  if [ -f "$INSTALL_DIR/go2_bridge.py" ]; then
+    chmod +x "$INSTALL_DIR/go2_bridge.py" || true
+    log "Using the current Go2 bridge from the SDK repository."
+    return 0
+  fi
   if [ -f "$SDK_HOME/go2_bridge.py.pre-install-backup" ]; then
     cp "$SDK_HOME/go2_bridge.py.pre-install-backup" "$INSTALL_DIR/go2_bridge.py"
     chmod +x "$INSTALL_DIR/go2_bridge.py" || true
-    log "Go2 bridge restored from pre-install backup."
-    return 0
-  fi
-  if [ -f "$INSTALL_DIR/go2_bridge.py" ]; then
-    chmod +x "$INSTALL_DIR/go2_bridge.py" || true
-    log "Go2 bridge present in SDK repository."
+    log "Go2 bridge restored from backup because the repository copy is missing."
     return 0
   fi
   return 1
@@ -526,6 +572,7 @@ fi
 
 chmod +x "$INSTALL_DIR/roc-robot-tpm-sdk.sh"
 restore_go2_bridge_if_needed || true
+build_go2_action_helper_if_possible
 
 mkdir -p "$SDK_HOME"
 run_sdk_bind
