@@ -45,6 +45,9 @@ class RobotExecutor:
         self.battery = 100
         self.sport_client = None
         self.sdk2_initialized = False
+        self._motion_process_lock = threading.Lock()
+        self._active_motion_process = None
+        self._cancel_requested = threading.Event()
         if not self.mock:
             self._init_unitree_sdk2()
 
@@ -154,32 +157,107 @@ else:
             raise RuntimeError('Go2 C++ action helper is missing: %s' % helper)
         cmd = [helper, NETWORK_INTERFACE, str(vx), str(vy), str(vyaw), str(int(duration_ms))]
         logger.info('Running verified C++ motion helper: %s', ' '.join(cmd))
-        result = subprocess.run(
+        process = subprocess.Popen(
             cmd, cwd=os.path.dirname(helper), env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=max(8, int(duration_ms / 1000) + 5)
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
         )
-        if result.returncode != 0:
-            raise RuntimeError('go2_tiny_move failed rc=%s output=%s' % (result.returncode, result.stdout))
-        return result.stdout
+        if duration_ms > 0:
+            with self._motion_process_lock:
+                self._active_motion_process = process
+        try:
+            try:
+                output, _ = process.communicate(timeout=max(8, int(duration_ms / 1000) + 5))
+            except subprocess.TimeoutExpired as exc:
+                process.terminate()
+                try:
+                    output, _ = process.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    output, _ = process.communicate(timeout=3)
+                raise RuntimeError('Go2 motion helper timed out: %s' % (output or exc.output or ''))
+        finally:
+            with self._motion_process_lock:
+                if self._active_motion_process is process:
+                    self._active_motion_process = None
+        if process.returncode != 0:
+            raise RuntimeError('go2_tiny_move failed rc=%s output=%s' % (process.returncode, output))
+        return output
+
+    def _terminate_active_motion(self):
+        with self._motion_process_lock:
+            process = self._active_motion_process
+        if process is None or process.poll() is not None:
+            return
+        logger.warning('Terminating active Go2 motion process pid=%s', process.pid)
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+
+    def _motion_is_active(self):
+        with self._motion_process_lock:
+            process = self._active_motion_process
+        return process is not None and process.poll() is None
 
     def _stop_sport_motion(self):
         if not self.mock:
+            self._cancel_requested.set()
+            self._terminate_active_motion()
             return self._run_tiny_motion(0.0, 0.0, 0.0, 0)
+
+    def _run_patrol_helper(self, distance, turn_seconds):
+        helper = SDK_ACTION_HELPER_BIN if os.path.isfile(SDK_ACTION_HELPER_BIN) else TINY_MOVE_BIN
+        if not os.path.isfile(helper):
+            raise RuntimeError('Go2 C++ action helper is missing: %s' % helper)
+        env = dict(os.environ)
+        env['LD_LIBRARY_PATH'] = TINY_MOVE_LD
+        cmd = [helper, NETWORK_INTERFACE, 'patrol', str(distance), str(turn_seconds)]
+        logger.info('Running continuous C++ patrol: %s', ' '.join(cmd))
+        process = subprocess.Popen(
+            cmd, cwd=os.path.dirname(helper), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        with self._motion_process_lock:
+            self._active_motion_process = process
+        try:
+            try:
+                output, _ = process.communicate(timeout=180)
+            except subprocess.TimeoutExpired as exc:
+                process.terminate()
+                try:
+                    output, _ = process.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    output, _ = process.communicate(timeout=3)
+                raise RuntimeError('Go2 patrol helper timed out: %s' % (output or exc.output or ''))
+        finally:
+            with self._motion_process_lock:
+                if self._active_motion_process is process:
+                    self._active_motion_process = None
+        if self._cancel_requested.is_set():
+            raise RuntimeError('Go2 patrol was cancelled')
+        if process.returncode != 0:
+            raise RuntimeError('Go2 patrol helper failed rc=%s output=%s' % (process.returncode, output))
+        logger.info('Go2 patrol completed: %s', output)
+        return output
 
     def _run_patrol_inspection(self, distance, turn_seconds):
         try:
             self.state = 'ACTION_RUNNING'
             self.error_msg = ''
-            speed = 0.30
-            duration_ms = int(max(0.5, min(float(distance or 10.0), 20.0)) / speed * 1000)
-            turn_ms = int(max(1.0, min(float(turn_seconds or 9.0), 12.0)) * 1000)
-            self._run_tiny_motion(speed, 0.0, 0.0, duration_ms)
-            time.sleep(0.5)
-            self._run_tiny_motion(0.0, 0.0, 0.8, turn_ms)
-            time.sleep(0.5)
-            self._run_tiny_motion(speed, 0.0, 0.0, duration_ms)
+            self._cancel_requested.clear()
+            patrol_distance = max(0.5, min(float(distance or 10.0), 20.0))
+            patrol_turn_seconds = max(1.0, min(float(turn_seconds or 9.0), 12.0))
+            self._run_patrol_helper(patrol_distance, patrol_turn_seconds)
             self.state = 'ACTION_DONE'
         except Exception as exc:
+            if self._cancel_requested.is_set():
+                self.state = 'ACTION_DONE'
+                self.error_msg = ''
+                logger.info('Go2 patrol stopped by request')
+                return
             self.state = 'ERROR'
             self.error_msg = 'Go2 patrol inspection failed: %s' % exc
             logger.exception(self.error_msg)
@@ -227,6 +305,9 @@ else:
                 return {'code': 200, 'message': 'Mock action %s finished' % normalized, 'data': {'action': normalized}}
 
             if normalized == 'patrol_inspection':
+                if self._motion_is_active():
+                    self.state = 'ACTION_RUNNING'
+                    return {'code': 409, 'message': 'A Go2 motion action is already running'}
                 threading.Thread(target=self._run_patrol_inspection, args=(meters or 10.0, seconds or 9.0), daemon=True).start()
                 return {'code': 200, 'message': 'Go2 patrol inspection started', 'data': {'action': normalized, 'meters': meters or 10.0, 'turnSeconds': seconds or 9.0}}
             if normalized == 'stop':
@@ -269,6 +350,7 @@ else:
             'sdk2_initialized': self.sdk2_initialized,
             'network_interface': NETWORK_INTERFACE,
             'action_helper_ready': os.path.isfile(SDK_ACTION_HELPER_BIN) or os.path.isfile(TINY_MOVE_BIN),
+            'motion_active': self._motion_is_active(),
             'error': self.error_msg,
         }
 
