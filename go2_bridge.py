@@ -47,6 +47,7 @@ class RobotExecutor:
         self.sdk2_initialized = False
         self._motion_process_lock = threading.Lock()
         self._active_motion_process = None
+        self._linear_motion_pending = False
         self._cancel_requested = threading.Event()
         if not self.mock:
             self._init_unitree_sdk2()
@@ -199,7 +200,65 @@ else:
     def _motion_is_active(self):
         with self._motion_process_lock:
             process = self._active_motion_process
-        return process is not None and process.poll() is None
+            return self._linear_motion_pending or (process is not None and process.poll() is None)
+
+    def _queue_linear_motion(self, action, distance, seconds):
+        self._cancel_requested.clear()
+        with self._motion_process_lock:
+            process = self._active_motion_process
+            if self._linear_motion_pending or (process is not None and process.poll() is None):
+                return False
+            self._linear_motion_pending = True
+        try:
+            threading.Thread(
+                target=self._run_linear_motion,
+                args=(action, distance, seconds),
+                daemon=True,
+            ).start()
+            return True
+        except Exception:
+            with self._motion_process_lock:
+                self._linear_motion_pending = False
+            raise
+
+    def _run_linear_motion(self, action, distance, seconds):
+        try:
+            self.state = 'ACTION_RUNNING'
+            self.error_msg = ''
+            if self._cancel_requested.is_set():
+                self.state = 'ACTION_DONE'
+                return
+            speed = 0.30 if distance > 10.0 else 0.18
+            duration_ms = int((float(seconds) * 1000) if seconds else (distance / speed * 1000))
+            duration_ms = max(100, min(duration_ms, 240000))
+            if self.mock:
+                time.sleep(min(duration_ms / 1000.0, 2.0))
+                output = 'mock linear motion'
+            else:
+                vx = speed if action == 'move_forward' else -speed
+                output = self._run_tiny_motion(vx, 0.0, 0.0, duration_ms)
+            if self._cancel_requested.is_set():
+                logger.info('Go2 linear motion stopped by request')
+            else:
+                logger.info('Go2 linear motion completed: %s', output)
+            self.state = 'ACTION_DONE'
+            self.error_msg = ''
+        except Exception as exc:
+            if self._cancel_requested.is_set():
+                self.state = 'ACTION_DONE'
+                self.error_msg = ''
+                logger.info('Go2 linear motion stopped by request')
+            else:
+                self.state = 'ERROR'
+                self.error_msg = 'Go2 linear motion failed: %s' % exc
+                logger.exception(self.error_msg)
+                try:
+                    self._stop_sport_motion()
+                except Exception:
+                    pass
+        finally:
+            with self._motion_process_lock:
+                self._linear_motion_pending = False
 
     def _stop_sport_motion(self):
         if not self.mock:
@@ -297,6 +356,19 @@ else:
         logger.info('Executing action=%s meters=%s seconds=%s yawRate=%s', normalized, meters, seconds, yaw_rate)
         try:
             if self.mock:
+                if normalized == 'stop':
+                    self._cancel_requested.set()
+                    self.state = 'ACTION_DONE'
+                    return {'code': 200, 'message': 'Mock motion stopped', 'data': {'action': normalized}}
+                if normalized in ('move_forward', 'move_backward'):
+                    distance = max(0.1, min(float(meters or 1.0), 60.0))
+                    if not self._queue_linear_motion(normalized, distance, seconds):
+                        return {'code': 409, 'message': 'A Go2 motion action is already running'}
+                    return {
+                        'code': 200,
+                        'message': 'Mock linear motion started',
+                        'data': {'action': normalized, 'meters': distance},
+                    }
                 if normalized == 'patrol_inspection':
                     threading.Thread(target=self._run_patrol_inspection, args=(meters or 10.0, seconds or 9.0), daemon=True).start()
                     return {'code': 200, 'message': 'Mock patrol inspection started', 'data': {'action': normalized}}
@@ -314,11 +386,13 @@ else:
                 output = self._stop_sport_motion()
             elif normalized in ('move_forward', 'move_backward'):
                 distance = max(0.1, min(float(meters or 1.0), 60.0))
-                speed = 0.30 if distance > 10.0 else 0.18
-                duration_ms = int((float(seconds) * 1000) if seconds else (distance / speed * 1000))
-                duration_ms = max(100, min(duration_ms, 240000))
-                vx = speed if normalized == 'move_forward' else -speed
-                output = self._run_tiny_motion(vx, 0.0, 0.0, duration_ms)
+                if not self._queue_linear_motion(normalized, distance, seconds):
+                    return {'code': 409, 'message': 'A Go2 motion action is already running'}
+                return {
+                    'code': 200,
+                    'message': 'Go2 linear motion started',
+                    'data': {'action': normalized, 'meters': distance},
+                }
             elif normalized == 'turn_around':
                 rate = max(0.1, min(float(yaw_rate or 0.8), 0.8))
                 duration_ms = int((float(seconds) * 1000) if seconds else 4000)

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SDK_VERSION="0.17.0-long-forward-demo"
+SDK_VERSION="0.18.0-dynamic-go2-bridge"
 DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://172.16.18.187:8090}"
 DEFAULT_REPO_URL="${ROC_SDK_REPO_URL:-https://github.com/robocoin-service/roc-robot-sdk.git}"
 INSTALL_DIR="${ROC_SDK_INSTALL_DIR:-$HOME/roc-robot-sdk}"
@@ -395,6 +395,7 @@ repair_go2_bridge_service_if_present() {
   go2_network_interface="$(detect_go2_network_interface)"
   log "Go2 bridge network interface: $go2_network_interface"
   if require_cmd sudo && [ -f "/etc/systemd/system/${BRIDGE_SERVICE_NAME}.service" ]; then
+    sudo sed -i -E "s#--server[[:space:]]+[^[:space:]]+#--server ${SERVER_URL}#g" "/etc/systemd/system/${BRIDGE_SERVICE_NAME}.service" || true
     sudo sed -i -E "s/--network[[:space:]]+[^[:space:]]+/--network ${go2_network_interface}/g" "/etc/systemd/system/${BRIDGE_SERVICE_NAME}.service" || true
   fi
   if ! restore_go2_bridge_if_needed; then

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SDK_VERSION="0.11.0-go2-diagnostics"
+SDK_VERSION="0.18.0-dynamic-go2-bridge"
 DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://172.16.18.187:8090}"
 MODE="${1:-}"
 SDK_HOME="${ROC_SDK_HOME:-$HOME/.roc-robot-sdk}"
@@ -115,12 +115,39 @@ sign(){
 
 post(){ curl -sS -H 'Content-Type: application/json; charset=utf-8' --data-binary "@$1" "$2" || true; }
 
+detect_go2_bridge_url(){
+  local server_host server_ip route_line source_ip bridge_port
+  has_cmd ip || return 0
+  server_host="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.urlsplit(sys.argv[1]).hostname or "")' "$SERVER_URL" 2>/dev/null || true)"
+  [ -n "$server_host" ] || return 0
+  server_ip="$server_host"
+  case "$server_ip" in
+    *[!0-9.]*)
+      if has_cmd getent; then
+        server_ip="$(getent ahostsv4 "$server_host" 2>/dev/null | awk 'NR == 1 { print $1 }')"
+      fi
+      ;;
+  esac
+  [ -n "$server_ip" ] || return 0
+  route_line="$(ip -4 route get "$server_ip" 2>/dev/null | head -1 || true)"
+  source_ip="$(printf '%s' "$route_line" | awk '{ for (i = 1; i <= NF; i++) if ($i == "src" && i < NF) { print $(i + 1); exit } }')"
+  if [ -z "$source_ip" ]; then
+    source_ip="$(ip -4 -o addr show scope global 2>/dev/null | awk -v go2="$GO2_NETWORK_INTERFACE" '$2 != go2 { split($4, a, "/"); print a[1]; exit }')"
+  fi
+  case "$source_ip" in
+    ""|127.*|169.254.*) return 0 ;;
+  esac
+  bridge_port="${ROC_GO2_BRIDGE_PORT:-8080}"
+  printf 'http://%s:%s' "$source_ip" "$bridge_port"
+}
+
 heartbeat(){
   at="$(date '+%Y-%m-%d %H:%M:%S')"; nonce="$(date +%s%N)-$(rand)"; interval="${ROC_HEARTBEAT_INTERVAL_SECONDS:-30}"
-  payload="event=HEARTBEAT;robotId=$ROBOT_ID;publicKeyFingerprint=$PUBLIC_KEY_FINGERPRINT;machineFingerprint=$MACHINE_FINGERPRINT;sdkVersion=$SDK_VERSION;nonce=$nonce;heartbeatAt=$at"
+  go2_bridge_url="$(detect_go2_bridge_url)"
+  payload="event=HEARTBEAT;robotId=$ROBOT_ID;publicKeyFingerprint=$PUBLIC_KEY_FINGERPRINT;machineFingerprint=$MACHINE_FINGERPRINT;sdkVersion=$SDK_VERSION;go2BridgeUrl=$go2_bridge_url;nonce=$nonce;heartbeatAt=$at"
   printf '%s' "$payload" > "$WORK_DIR/payload.txt"; sig="$(sign)"
   cat > "$OUTPUT_DIR/heartbeat-report.json" <<JSON
-{"robotId":$ROBOT_ID,"sdkVersion":$(jv "$SDK_VERSION"),"deviceType":"LINUX_GO2_ADAPTIVE_ROBOT","computerName":$(jv "$COMPUTER_NAME"),"cpuModel":$(jv "$CPU_MODEL"),"machineFingerprint":$(jv "$MACHINE_FINGERPRINT"),"publicKeyFingerprint":$(jv "$PUBLIC_KEY_FINGERPRINT"),"platformIdentityType":$(jv "$PLATFORM_IDENTITY_TYPE"),"platformIdentityFingerprint":$(jv "$PLATFORM_IDENTITY_FINGERPRINT"),"go2NetworkInterface":$(jv "$GO2_NETWORK_INTERFACE"),"go2SdkDetected":$GO2_SDK_DETECTED,"go2StateReadable":$GO2_STATE_READABLE,"heartbeatAt":$(jv "$at"),"heartbeatIntervalSeconds":$interval,"nonce":$(jv "$nonce"),"signatureAlgorithm":"RSASSA-SHA256","signaturePrivateKey":$(jv "$SIGNATURE_PRIVATE_KEY_LABEL"),"signaturePayload":$(jv "$payload"),"signature":$(jv "$sig")}
+{"robotId":$ROBOT_ID,"sdkVersion":$(jv "$SDK_VERSION"),"deviceType":"LINUX_GO2_ADAPTIVE_ROBOT","computerName":$(jv "$COMPUTER_NAME"),"cpuModel":$(jv "$CPU_MODEL"),"machineFingerprint":$(jv "$MACHINE_FINGERPRINT"),"publicKeyFingerprint":$(jv "$PUBLIC_KEY_FINGERPRINT"),"platformIdentityType":$(jv "$PLATFORM_IDENTITY_TYPE"),"platformIdentityFingerprint":$(jv "$PLATFORM_IDENTITY_FINGERPRINT"),"go2NetworkInterface":$(jv "$GO2_NETWORK_INTERFACE"),"go2BridgeUrl":$(jv "$go2_bridge_url"),"go2SdkDetected":$GO2_SDK_DETECTED,"go2StateReadable":$GO2_STATE_READABLE,"heartbeatAt":$(jv "$at"),"heartbeatIntervalSeconds":$interval,"nonce":$(jv "$nonce"),"signatureAlgorithm":"RSASSA-SHA256","signaturePrivateKey":$(jv "$SIGNATURE_PRIVATE_KEY_LABEL"),"signaturePayload":$(jv "$payload"),"signature":$(jv "$sig")}
 JSON
   resp="$(post "$OUTPUT_DIR/heartbeat-report.json" "${SERVER_URL%/}/user/sdkAgent/heartbeat")"; printf '%s\n' "$resp" > "$OUTPUT_DIR/heartbeat-server-response.json"
   printf '%s' "$resp" | grep -q '"code":200' && log "Heartbeat verified at $at" || log "Heartbeat failed: $resp"
@@ -137,6 +164,7 @@ doctor_summary(){
   echo "[ROC SDK DOCTOR] Version: $SDK_VERSION"
   echo "[ROC SDK DOCTOR] SDK home: $SDK_HOME"
   echo "[ROC SDK DOCTOR] Server URL: $SERVER_URL"
+  echo "[ROC SDK DOCTOR] Go2 bridge URL: $(detect_go2_bridge_url)"
   [ -f "$SDK_HOME/robot-id" ] && echo "[ROC SDK DOCTOR] Robot ID: $(cat "$SDK_HOME/robot-id")" || echo "[ROC SDK DOCTOR] Robot ID: missing"
   echo "[ROC SDK DOCTOR] Time: $(date 2>/dev/null || true)"
   echo "[ROC SDK DOCTOR] Hostname: $(hostname 2>/dev/null || echo unknown)"

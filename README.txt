@@ -26,5 +26,6 @@ Go2 network model:
 - On an onboard Go2/Orin computer, Unitree DDS actions use the internal 192.168.123.x interface, normally eth0.
 - The installer detects the route to the Go2 controller at 192.168.123.161 and builds the C++ action helper automatically.
 - Patrol actions run forward, turn, and forward again in one C++ control session; STOP terminates the entire active patrol.
-- Long forward demo actions support MOVE_FORWARD/FORWARD up to 60 m; a 50 m request runs as one continuous motion and can be stopped through STOP.
+- Long forward demo actions support MOVE_FORWARD/FORWARD up to 60 m; long motion starts asynchronously, reports live motion status, and can be interrupted through STOP.
+- Signed Agent heartbeats advertise the current WiFi bridge URL so the platform can follow DHCP address changes without a hard-coded robot IP.
 - Set ROC_GO2_NETWORK_INTERFACE only when automatic detection is not correct.
