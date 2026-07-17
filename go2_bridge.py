@@ -33,6 +33,19 @@ NETWORK_INTERFACE = args.network
 TINY_MOVE_BIN = '/home/unitree/go2_tiny_move/build/go2_tiny_move'
 TINY_MOVE_LD = '/home/unitree/Downloads/sdk/unitree_sdk2/thirdparty/lib/aarch64:/home/unitree/Downloads/sdk/unitree_sdk2/lib/aarch64'
 SDK_ACTION_HELPER_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'go2_helper', 'build', 'go2_action_helper')
+LINEAR_RAMP_MS = 800
+
+
+def env_speed(name, default, minimum, maximum):
+    try:
+        value = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+SHORT_MOVE_SPEED = env_speed('ROC_GO2_SHORT_MOVE_SPEED', 0.22, 0.15, 0.40)
+LONG_MOVE_SPEED = env_speed('ROC_GO2_LONG_MOVE_SPEED', 0.60, 0.30, 0.80)
 
 
 class RobotExecutor:
@@ -228,11 +241,17 @@ else:
             if self._cancel_requested.is_set():
                 self.state = 'ACTION_DONE'
                 return
-            speed = 0.30 if distance > 10.0 else 0.18
-            duration_ms = int((float(seconds) * 1000) if seconds else (distance / speed * 1000))
+            speed = LONG_MOVE_SPEED if distance > 10.0 else SHORT_MOVE_SPEED
+            duration_ms = int(
+                (float(seconds) * 1000)
+                if seconds
+                else (distance / speed * 1000 + LINEAR_RAMP_MS)
+            )
             duration_ms = max(100, min(duration_ms, 240000))
             if self.mock:
-                time.sleep(min(duration_ms / 1000.0, 2.0))
+                mock_deadline = time.monotonic() + min(duration_ms / 1000.0, 2.0)
+                while time.monotonic() < mock_deadline and not self._cancel_requested.wait(0.05):
+                    pass
                 output = 'mock linear motion'
             else:
                 vx = speed if action == 'move_forward' else -speed
@@ -425,6 +444,9 @@ else:
             'network_interface': NETWORK_INTERFACE,
             'action_helper_ready': os.path.isfile(SDK_ACTION_HELPER_BIN) or os.path.isfile(TINY_MOVE_BIN),
             'motion_active': self._motion_is_active(),
+            'short_move_speed_mps': SHORT_MOVE_SPEED,
+            'long_move_speed_mps': LONG_MOVE_SPEED,
+            'linear_ramp_ms': LINEAR_RAMP_MS,
             'error': self.error_msg,
         }
 
@@ -483,6 +505,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self._send_json({'code': 500, 'message': str(exc)}, 500)
             return
         if parsed.path == '/api/v1/cancel':
+            self._read_json()
             executor.execute_action('STOP')
             self._send_json({'code': 200, 'message': 'Task cancelled and robot stopped'})
             return

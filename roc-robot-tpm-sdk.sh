@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SDK_VERSION="0.18.0-dynamic-go2-bridge"
+SDK_VERSION="0.19.0-filtered-fast-motion"
 DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://172.16.18.187:8090}"
 MODE="${1:-}"
 SDK_HOME="${ROC_SDK_HOME:-$HOME/.roc-robot-sdk}"

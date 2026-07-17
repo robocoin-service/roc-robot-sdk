@@ -27,5 +27,6 @@ Go2 network model:
 - The installer detects the route to the Go2 controller at 192.168.123.161 and builds the C++ action helper automatically.
 - Patrol actions run forward, turn, and forward again in one C++ control session; STOP terminates the entire active patrol.
 - Long forward demo actions support MOVE_FORWARD/FORWARD up to 60 m; long motion starts asynchronously, reports live motion status, and can be interrupted through STOP.
+- Long forward motion defaults to 0.60 m/s, applies an 800 ms acceleration/deceleration ramp, and clamps configured speed to 0.80 m/s.
 - Signed Agent heartbeats advertise the current WiFi bridge URL so the platform can follow DHCP address changes without a hard-coded robot IP.
 - Set ROC_GO2_NETWORK_INTERFACE only when automatic detection is not correct.

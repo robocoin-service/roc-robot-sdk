@@ -157,7 +157,7 @@ int main(int argc, char **argv) {
     int duration_ms = argc > 5 ? parse_int(argv[5], 0) : 0;
 
     duration_ms = std::max(0, std::min(duration_ms, 240000));
-    vx = std::max(-0.40f, std::min(vx, 0.40f));
+    vx = std::max(-0.80f, std::min(vx, 0.80f));
     vy = std::max(-0.30f, std::min(vy, 0.30f));
     vyaw = std::max(-0.90f, std::min(vyaw, 0.90f));
 
@@ -167,9 +167,21 @@ int main(int argc, char **argv) {
         const int stand_code = prepare_motion(client);
         if (stand_code != 0) return 4;
 
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(duration_ms);
+        const auto start = std::chrono::steady_clock::now();
+        const auto deadline = start + std::chrono::milliseconds(duration_ms);
+        const bool ramp_linear = vyaw == 0.0f && (vx != 0.0f || vy != 0.0f);
+        constexpr float ramp_ms = 800.0f;
         do {
-            move_code = client.Move(vx, vy, vyaw);
+            const auto now = std::chrono::steady_clock::now();
+            float scale = 1.0f;
+            if (ramp_linear) {
+                const float elapsed_ms = static_cast<float>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count());
+                const float remaining_ms = static_cast<float>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+                scale = std::max(0.0f, std::min(1.0f, std::min(elapsed_ms / ramp_ms, remaining_ms / ramp_ms)));
+            }
+            move_code = client.Move(vx * scale, vy * scale, vyaw);
             if (move_code != 0) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         } while (std::chrono::steady_clock::now() < deadline);
