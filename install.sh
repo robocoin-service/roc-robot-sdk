@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SDK_VERSION="0.19.0-filtered-fast-motion"
+SDK_VERSION="1.0.0-core-adapter"
 DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://172.16.18.187:8090}"
 DEFAULT_REPO_URL="${ROC_SDK_REPO_URL:-https://github.com/robocoin-service/roc-robot-sdk.git}"
 INSTALL_DIR="${ROC_SDK_INSTALL_DIR:-$HOME/roc-robot-sdk}"
 SDK_HOME="${ROC_SDK_HOME:-$HOME/.roc-robot-sdk}"
 SERVICE_NAME="${ROC_SDK_SERVICE_NAME:-roc-robot-agent}"
-DEVICE_PROFILE="${ROC_DEVICE_PROFILE:-auto}"
-BRIDGE_SERVICE_NAME="${ROC_GO2_BRIDGE_SERVICE_NAME:-go2-bridge}"
+DEVICE_PROFILE="${ROC_DEVICE_PROFILE:-generic}"
+ROC_ADAPTERS="${ROC_ADAPTERS:-none}"
+TEST_MODE="${ROC_SDK_TEST_MODE:-0}"
 RUN_SERVICE_AS_ROOT=0
 SOFTWARE_IDENTITY_ENV="${ROC_ALLOW_SOFTWARE_IDENTITY:-}"
 
@@ -27,7 +28,10 @@ Environment:
   ROC_SDK_INSTALL_DIR    Install directory. Default: $INSTALL_DIR
   ROC_SDK_HOME           SDK runtime directory. Default: $SDK_HOME
   ROC_SKIP_DEP_INSTALL   Set to 1 to skip dependency installation.
-  ROC_DEVICE_PROFILE     auto | go2 | industrial. Default: auto.
+  ROC_DEVICE_PROFILE     generic | industrial. Default: generic.
+  ROC_ADAPTERS           Comma-separated optional adapters, for example: go2.
+                         Default: none. Core never installs a hardware adapter implicitly.
+  ROC_SDK_TEST_MODE      Set to 1 for an offline Core installation smoke test.
   ROC_ALLOW_SOFTWARE_IDENTITY
                          Set to 1 to allow software RSA fallback explicitly.
 EOF
@@ -83,13 +87,31 @@ configure_identity_policy() {
     return 0
   fi
 
-  if detect_go2_or_orin; then
-    SOFTWARE_IDENTITY_ENV=1
-    log "Detected Go2/Orin-like device. Software RSA identity fallback is enabled."
-  else
-    SOFTWARE_IDENTITY_ENV=0
-    log "Industrial profile detected. TPM identity is required unless ROC_ALLOW_SOFTWARE_IDENTITY=1 is set."
+  SOFTWARE_IDENTITY_ENV=0
+  log "Generic/industrial Core profile: TPM identity is required unless ROC_ALLOW_SOFTWARE_IDENTITY=1 is explicitly set."
+}
+
+adapter_requested() {
+  case ",${ROC_ADAPTERS}," in
+    *,"$1",*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+install_requested_adapters() {
+  if [ "$ROC_ADAPTERS" = "none" ] || [ -z "$ROC_ADAPTERS" ]; then
+    log "No hardware adapter selected. Installing generic SDK Core only."
+    return 0
   fi
+  if adapter_requested go2; then
+    log "Installing optional Go2 adapter."
+    "$INSTALL_DIR/adapters/go2/install.sh" "$SERVER_URL"
+  fi
+  local adapter
+  IFS=',' read -r -a requested_adapters <<< "$ROC_ADAPTERS"
+  for adapter in "${requested_adapters[@]}"; do
+    [ -z "$adapter" ] || [ "$adapter" = "go2" ] || { log "Unknown adapter requested: $adapter"; exit 1; }
+  done
 }
 
 parse_server_host_port() {
@@ -339,7 +361,7 @@ build_go2_action_helper_if_possible() {
     fi
   fi
 
-  log "Building verified Go2 C++ action helper with SDK: $sdk_dir"
+  log "Building Go2 action, LiDAR navigation, and planner test binaries with SDK: $sdk_dir"
   cmake -S "$INSTALL_DIR/go2_helper" -B "$INSTALL_DIR/go2_helper/build" -DUNITREE_SDK_DIR="$sdk_dir"
   cmake --build "$INSTALL_DIR/go2_helper/build" --parallel 2
 }
@@ -547,14 +569,18 @@ log "Server: $SERVER_URL"
 log "Install directory: $INSTALL_DIR"
 log "SDK home: $SDK_HOME"
 log "Device profile: $DEVICE_PROFILE"
+log "Requested adapters: $ROC_ADAPTERS"
 
 configure_identity_policy
 install_dependencies_if_needed
 check_system_time
-wait_for_server_available
+if [ "$TEST_MODE" != "1" ]; then
+  wait_for_server_available
+else
+  log "Test mode: skipping server availability check."
+fi
 stop_existing_agent
 mkdir -p "$SDK_HOME"
-backup_go2_bridge_if_present
 
 if [ -d "$INSTALL_DIR/.git" ]; then
   log "SDK directory exists. Pulling latest version..."
@@ -572,14 +598,17 @@ else
 fi
 
 chmod +x "$INSTALL_DIR/roc-robot-tpm-sdk.sh"
-restore_go2_bridge_if_needed || true
-build_go2_action_helper_if_possible
+chmod +x "$INSTALL_DIR/adapters/go2/install.sh" 2>/dev/null || true
 
 mkdir -p "$SDK_HOME"
+install_requested_adapters
+if [ "$TEST_MODE" = "1" ]; then
+  log "Test mode: Core files and optional adapter selection validated; binding and service start skipped."
+  exit 0
+fi
 run_sdk_bind
 ROBOT_ID="$(read_robot_id)"
 install_systemd_service "$ROBOT_ID"
-repair_go2_bridge_service_if_present
 run_doctor_summary
 wait_for_heartbeat_verified "$ROBOT_ID"
 log "Install complete. Return to the web page and refresh the robot list."

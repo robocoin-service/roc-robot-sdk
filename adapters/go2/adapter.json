@@ -1,0 +1,9 @@
+{
+  "id": "go2",
+  "displayName": "Unitree Go2 Adapter",
+  "version": "1.0.0",
+  "platform": "linux",
+  "capabilities": ["motion", "patrol", "stop", "robot-status"],
+  "requires": ["unitree-sdk2", "go2-dds-network"],
+  "entrypoint": "go2_bridge.py"
+}

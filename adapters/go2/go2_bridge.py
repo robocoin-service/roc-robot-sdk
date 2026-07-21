@@ -33,6 +33,9 @@ NETWORK_INTERFACE = args.network
 TINY_MOVE_BIN = '/home/unitree/go2_tiny_move/build/go2_tiny_move'
 TINY_MOVE_LD = '/home/unitree/Downloads/sdk/unitree_sdk2/thirdparty/lib/aarch64:/home/unitree/Downloads/sdk/unitree_sdk2/lib/aarch64'
 SDK_ACTION_HELPER_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'go2_helper', 'build', 'go2_action_helper')
+OBSTACLE_AVOID_HELPER_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'go2_helper', 'build', 'go2_obstacle_move')
+LIDAR_NAV_HELPER_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'go2_helper', 'build', 'go2_lidar_navigator')
+CAMERA_PROBE_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'go2_helper', 'build', 'go2_camera_probe')
 LINEAR_RAMP_MS = 800
 
 
@@ -46,6 +49,44 @@ def env_speed(name, default, minimum, maximum):
 
 SHORT_MOVE_SPEED = env_speed('ROC_GO2_SHORT_MOVE_SPEED', 0.22, 0.15, 0.40)
 LONG_MOVE_SPEED = env_speed('ROC_GO2_LONG_MOVE_SPEED', 0.60, 0.30, 0.80)
+LIDAR_NAV_SPEED = env_speed('ROC_GO2_LIDAR_NAV_SPEED', 0.22, 0.10, 0.35)
+LIDAR_STOP_DISTANCE = env_speed('ROC_GO2_LIDAR_STOP_DISTANCE', 0.80, 0.40, 1.50)
+LIDAR_SIDE_CLEARANCE = env_speed('ROC_GO2_LIDAR_SIDE_CLEARANCE', 1.20, 0.40, 1.50)
+LIDAR_LATERAL_SHIFT = env_speed('ROC_GO2_LIDAR_LATERAL_SHIFT', 0.80, 0.40, 1.50)
+
+
+def env_int(name, default, minimum, maximum):
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+LIDAR_MAX_BYPASS_ATTEMPTS = env_int('ROC_GO2_LIDAR_MAX_BYPASS_ATTEMPTS', 2, 0, 4)
+
+
+def wait_for_network_interface(interface, timeout_seconds=90):
+    deadline = time.monotonic() + timeout_seconds
+    logger.info('Waiting for DDS interface %s to have an IPv4 address', interface)
+    while time.monotonic() < deadline:
+        try:
+            result = subprocess.run(
+                ['ip', '-4', 'addr', 'show', 'dev', interface],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=3,
+            )
+            if result.returncode == 0 and 'inet ' in result.stdout:
+                # CycloneDDS may enumerate interfaces just after the address appears.
+                time.sleep(2)
+                logger.info('DDS interface %s is ready', interface)
+                return True
+        except (OSError, subprocess.SubprocessError):
+            pass
+        time.sleep(1)
+    return False
 
 
 class RobotExecutor:
@@ -66,6 +107,10 @@ class RobotExecutor:
             self._init_unitree_sdk2()
 
     def _init_unitree_sdk2(self):
+        if not wait_for_network_interface(NETWORK_INTERFACE):
+            raise SystemExit(
+                'DDS interface %s did not become ready within 90 seconds' % NETWORK_INTERFACE
+            )
         try:
             logger.info('Initializing unitree_sdk2py on interface: %s', NETWORK_INTERFACE)
             from unitree_sdk2py.core.channel import ChannelFactoryInitialize
@@ -197,6 +242,76 @@ else:
             raise RuntimeError('go2_tiny_move failed rc=%s output=%s' % (process.returncode, output))
         return output
 
+    def _run_lidar_navigation(self, distance):
+        if not os.path.isfile(LIDAR_NAV_HELPER_BIN):
+            raise RuntimeError('Go2 LiDAR navigator is missing: %s' % LIDAR_NAV_HELPER_BIN)
+        env = dict(os.environ)
+        env['LD_LIBRARY_PATH'] = TINY_MOVE_LD
+        cmd = [
+            LIDAR_NAV_HELPER_BIN,
+            NETWORK_INTERFACE,
+            str(float(distance)),
+            str(LIDAR_NAV_SPEED),
+            str(LIDAR_STOP_DISTANCE),
+            str(LIDAR_SIDE_CLEARANCE),
+            str(LIDAR_LATERAL_SHIFT),
+            str(LIDAR_MAX_BYPASS_ATTEMPTS),
+        ]
+        logger.info('Running isolated Go2 LiDAR navigation helper: %s', ' '.join(cmd))
+        process = subprocess.Popen(
+            cmd, cwd=os.path.dirname(LIDAR_NAV_HELPER_BIN), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        with self._motion_process_lock:
+            self._active_motion_process = process
+        timeout_seconds = max(180, min(1300, int(distance / LIDAR_NAV_SPEED * 4 + 130)))
+        try:
+            try:
+                output, _ = process.communicate(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired as exc:
+                process.terminate()
+                try:
+                    output, _ = process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    output, _ = process.communicate(timeout=3)
+                raise RuntimeError('Go2 LiDAR navigation timed out: %s' % (output or exc.output or ''))
+        finally:
+            with self._motion_process_lock:
+                if self._active_motion_process is process:
+                    self._active_motion_process = None
+        if process.returncode != 0:
+            raise RuntimeError('Go2 LiDAR navigation failed rc=%s output=%s' % (process.returncode, output))
+        return output
+
+    def _run_obstacle_avoid_helper(self, action, speed, duration_ms):
+        if not os.path.isfile(OBSTACLE_AVOID_HELPER_BIN):
+            raise RuntimeError('Go2 obstacle avoidance helper is missing: %s' % OBSTACLE_AVOID_HELPER_BIN)
+        vx = speed if action == 'move_forward' else -speed
+        env = dict(os.environ)
+        env['LD_LIBRARY_PATH'] = TINY_MOVE_LD
+        cmd = [OBSTACLE_AVOID_HELPER_BIN, NETWORK_INTERFACE, str(vx), str(int(duration_ms))]
+        logger.info('Running isolated C++ obstacle avoidance helper: %s', ' '.join(cmd))
+        process = subprocess.Popen(
+            cmd, cwd=os.path.dirname(OBSTACLE_AVOID_HELPER_BIN), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        with self._motion_process_lock:
+            self._active_motion_process = process
+        try:
+            output, _ = process.communicate(timeout=max(12, int(duration_ms / 1000) + 8))
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            output, _ = process.communicate(timeout=3)
+            raise RuntimeError('Go2 obstacle avoidance helper timed out: %s' % output)
+        finally:
+            with self._motion_process_lock:
+                if self._active_motion_process is process:
+                    self._active_motion_process = None
+        if process.returncode != 0:
+            raise RuntimeError('Go2 obstacle avoidance helper failed rc=%s output=%s' % (process.returncode, output))
+        return output
+
     def _terminate_active_motion(self):
         with self._motion_process_lock:
             process = self._active_motion_process
@@ -205,7 +320,9 @@ else:
         logger.warning('Terminating active Go2 motion process pid=%s', process.pid)
         process.terminate()
         try:
-            process.wait(timeout=3)
+            # The LiDAR helper handles SIGTERM by sending zero velocity and
+            # releasing ObstaclesAvoidClient command authority before exit.
+            process.wait(timeout=6)
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=3)
@@ -253,9 +370,10 @@ else:
                 while time.monotonic() < mock_deadline and not self._cancel_requested.wait(0.05):
                     pass
                 output = 'mock linear motion'
+            elif action == 'navigate_forward_avoid':
+                output = self._run_lidar_navigation(distance)
             else:
-                vx = speed if action == 'move_forward' else -speed
-                output = self._run_tiny_motion(vx, 0.0, 0.0, duration_ms)
+                output = self._run_obstacle_avoid_helper(action, speed, duration_ms)
             if self._cancel_requested.is_set():
                 logger.info('Go2 linear motion stopped by request')
             else:
@@ -354,6 +472,9 @@ else:
             'DANCE2': 'dance2',
             'MOVE_FORWARD': 'move_forward',
             'FORWARD': 'move_forward',
+            'NAVIGATE_FORWARD_AVOID': 'navigate_forward_avoid',
+            'MOVE_FORWARD_AVOID': 'navigate_forward_avoid',
+            'SMART_FORWARD': 'navigate_forward_avoid',
             'MOVE_BACKWARD': 'move_backward',
             'BACKWARD': 'move_backward',
             'TURN_AROUND': 'turn_around',
@@ -379,7 +500,7 @@ else:
                     self._cancel_requested.set()
                     self.state = 'ACTION_DONE'
                     return {'code': 200, 'message': 'Mock motion stopped', 'data': {'action': normalized}}
-                if normalized in ('move_forward', 'move_backward'):
+                if normalized in ('move_forward', 'move_backward', 'navigate_forward_avoid'):
                     distance = max(0.1, min(float(meters or 1.0), 60.0))
                     if not self._queue_linear_motion(normalized, distance, seconds):
                         return {'code': 409, 'message': 'A Go2 motion action is already running'}
@@ -403,7 +524,7 @@ else:
                 return {'code': 200, 'message': 'Go2 patrol inspection started', 'data': {'action': normalized, 'meters': meters or 10.0, 'turnSeconds': seconds or 9.0}}
             if normalized == 'stop':
                 output = self._stop_sport_motion()
-            elif normalized in ('move_forward', 'move_backward'):
+            elif normalized in ('move_forward', 'move_backward', 'navigate_forward_avoid'):
                 distance = max(0.1, min(float(meters or 1.0), 60.0))
                 if not self._queue_linear_motion(normalized, distance, seconds):
                     return {'code': 409, 'message': 'A Go2 motion action is already running'}
@@ -447,6 +568,16 @@ else:
             'short_move_speed_mps': SHORT_MOVE_SPEED,
             'long_move_speed_mps': LONG_MOVE_SPEED,
             'linear_ramp_ms': LINEAR_RAMP_MS,
+            'obstacle_avoidance_ready': os.path.isfile(OBSTACLE_AVOID_HELPER_BIN),
+            'lidar_navigation_ready': os.path.isfile(LIDAR_NAV_HELPER_BIN),
+            'camera_probe_ready': os.path.isfile(CAMERA_PROBE_BIN),
+            'lidar_navigation': {
+                'speed_mps': LIDAR_NAV_SPEED,
+                'stop_distance_m': LIDAR_STOP_DISTANCE,
+                'side_clearance_m': LIDAR_SIDE_CLEARANCE,
+                'lateral_shift_m': LIDAR_LATERAL_SHIFT,
+                'max_bypass_attempts': LIDAR_MAX_BYPASS_ATTEMPTS,
+            },
             'error': self.error_msg,
         }
 
