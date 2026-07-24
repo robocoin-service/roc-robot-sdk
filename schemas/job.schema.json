@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/robocoin-service/roc-robot-sdk/schemas/job.schema.json",
+  "title": "ROC Robot Standard Job",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "id",
+    "type",
+    "requiredCapabilities",
+    "parameters",
+    "safetyPolicy"
+  ],
+  "properties": {
+    "$schema": {"type": "string"},
+    "schemaVersion": {"const": "roc.job.v1"},
+    "id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "idempotencyKey": {"type": "string", "minLength": 1, "maxLength": 256},
+    "type": {"type": "string", "pattern": "^[A-Z][A-Z0-9_-]*$"},
+    "requiredCapabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "parameters": {"type": "object"},
+    "safetyPolicy": {
+      "type": "object",
+      "properties": {
+        "cancelOnTimeout": {"type": "boolean"},
+        "requiresOperator": {"type": "boolean"}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/robocoin-service/roc-robot-sdk/schemas/job-event.schema.json",
+  "title": "ROC Robot Job Event",
+  "type": "object",
+  "required": [
+    "eventId",
+    "type",
+    "jobId",
+    "jobType",
+    "idempotencyKey",
+    "adapterId",
+    "state",
+    "detail",
+    "occurredAt",
+    "delivered"
+  ],
+  "properties": {
+    "$schema": {"type": "string"},
+    "eventId": {"type": "string", "minLength": 1},
+    "type": {"const": "job.state.changed"},
+    "jobId": {"type": "string", "minLength": 1},
+    "jobType": {"type": "string", "minLength": 1},
+    "idempotencyKey": {"type": "string", "minLength": 1},
+    "adapterId": {"type": ["string", "null"]},
+    "state": {
+      "enum": [
+        "RECEIVED",
+        "VALIDATED",
+        "STARTING",
+        "RUNNING",
+        "CANCELLING",
+        "SUCCEEDED",
+        "FAILED",
+        "CANCELLED",
+        "TIMED_OUT",
+        "REJECTED"
+      ]
+    },
+    "detail": {"type": "object"},
+    "occurredAt": {"type": "string", "format": "date-time"},
+    "delivered": {"type": "boolean"}
+  },
+  "additionalProperties": false
+}

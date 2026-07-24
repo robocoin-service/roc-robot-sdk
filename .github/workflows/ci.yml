@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate Python
+        run: |
+          python -m py_compile \
+            roc_adapter_runtime.py \
+            adapters/mock-wheel/adapter.py \
+            adapters/go2/runtime_adapter.py \
+            adapters/go2/go2_bridge.py
+          python -m unittest discover -v
+
+      - name: Validate shell
+        run: |
+          bash -n \
+            install.sh \
+            roc-robot-tpm-sdk.sh \
+            adapters/go2/install.sh \
+            tests/test-adapter-runtime.sh \
+            tests/test-adapter-selection.sh \
+            tests/test-core-install.sh
+
+      - name: Run Linux integration tests
+        run: |
+          bash tests/test-adapter-runtime.sh
+          bash tests/test-adapter-selection.sh
+          bash tests/test-core-install.sh
+
+      - name: Check patch hygiene
+        run: git diff --check

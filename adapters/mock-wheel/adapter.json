@@ -1,9 +1,9 @@
 {
   "$schema": "../../schemas/adapter-manifest.schema.json",
   "manifestVersion": 1,
-  "id": "go2",
-  "displayName": "Unitree Go2 Adapter",
-  "version": "1.1.0",
+  "id": "mock-wheel",
+  "displayName": "Mock Differential-Drive Robot",
+  "version": "1.0.0",
   "platform": "linux",
   "protocol": "roc.adapter.jsonl.v1",
   "capabilities": [
@@ -16,6 +16,6 @@
     "telemetry.basic"
   ],
   "jobTypes": ["DELIVERY", "INSPECTION", "PATROL", "STOP"],
-  "requires": ["unitree-sdk2", "go2-dds-network"],
-  "entrypoint": ["python3", "runtime_adapter.py"]
+  "requires": [],
+  "entrypoint": ["python3", "adapter.py"]
 }

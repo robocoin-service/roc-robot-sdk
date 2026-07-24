@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SDK_VERSION="1.0.0-core-adapter"
-DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://172.16.18.187:8090}"
+SDK_VERSION="1.1.0-adapter-runtime"
+DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://127.0.0.1:8090}"
 DEFAULT_REPO_URL="${ROC_SDK_REPO_URL:-https://github.com/robocoin-service/roc-robot-sdk.git}"
 INSTALL_DIR="${ROC_SDK_INSTALL_DIR:-$HOME/roc-robot-sdk}"
 SDK_HOME="${ROC_SDK_HOME:-$HOME/.roc-robot-sdk}"
@@ -29,9 +29,10 @@ Environment:
   ROC_SDK_HOME           SDK runtime directory. Default: $SDK_HOME
   ROC_SKIP_DEP_INSTALL   Set to 1 to skip dependency installation.
   ROC_DEVICE_PROFILE     generic | industrial. Default: generic.
-  ROC_ADAPTERS           Comma-separated optional adapters, for example: go2.
-                         Default: none. Core never installs a hardware adapter implicitly.
+  ROC_ADAPTERS           Comma-separated manifest IDs, for example: go2 or mock-wheel.
+                         Default: none. Adapters are discovered from adapters/*/adapter.json.
   ROC_SDK_TEST_MODE      Set to 1 for an offline Core installation smoke test.
+  ROC_SDK_SOURCE_DIR     Test mode only: copy this working tree instead of cloning.
   ROC_ALLOW_SOFTWARE_IDENTITY
                          Set to 1 to allow software RSA fallback explicitly.
 EOF
@@ -56,31 +57,6 @@ sudo_cmd() {
   fi
 }
 
-detect_go2_or_orin() {
-  case "$DEVICE_PROFILE" in
-    go2|GO2|unitree|UNITREE)
-      return 0
-      ;;
-    industrial|INDUSTRIAL|ipc|IPC)
-      return 1
-      ;;
-  esac
-
-  if [ -r /proc/device-tree/model ] && tr -d '\000' </proc/device-tree/model | grep -Eiq 'unitree|go2|orin|jetson|nvidia'; then
-    return 0
-  fi
-  if [ -d "$HOME/unitree_sdk2" ] || [ -d "$HOME/Downloads/sdk/unitree_sdk2" ] || [ -d /opt/unitree_sdk2 ]; then
-    return 0
-  fi
-  if require_cmd ip && ip -br addr 2>/dev/null | grep -q '192\.168\.123\.'; then
-    return 0
-  fi
-  if [ -n "$(find /sys/devices/platform -maxdepth 3 \( -name ecid -o -name public_key \) 2>/dev/null | head -n 1)" ]; then
-    return 0
-  fi
-  return 1
-}
-
 configure_identity_policy() {
   if [ -n "$SOFTWARE_IDENTITY_ENV" ]; then
     log "Software identity override: ROC_ALLOW_SOFTWARE_IDENTITY=$SOFTWARE_IDENTITY_ENV"
@@ -88,14 +64,8 @@ configure_identity_policy() {
   fi
 
   SOFTWARE_IDENTITY_ENV=0
-  log "Generic/industrial Core profile: TPM identity is required unless ROC_ALLOW_SOFTWARE_IDENTITY=1 is explicitly set."
-}
-
-adapter_requested() {
-  case ",${ROC_ADAPTERS}," in
-    *,"$1",*) return 0 ;;
-    *) return 1 ;;
-  esac
+  log "Generic/industrial Core profile: TPM identity is required."
+  log "Set ROC_ALLOW_SOFTWARE_IDENTITY=1 to opt in to software identity."
 }
 
 install_requested_adapters() {
@@ -103,14 +73,27 @@ install_requested_adapters() {
     log "No hardware adapter selected. Installing generic SDK Core only."
     return 0
   fi
-  if adapter_requested go2; then
-    log "Installing optional Go2 adapter."
-    "$INSTALL_DIR/adapters/go2/install.sh" "$SERVER_URL"
-  fi
-  local adapter
+
+  local adapter adapter_dir install_script
   IFS=',' read -r -a requested_adapters <<< "$ROC_ADAPTERS"
   for adapter in "${requested_adapters[@]}"; do
-    [ -z "$adapter" ] || [ "$adapter" = "go2" ] || { log "Unknown adapter requested: $adapter"; exit 1; }
+    adapter="${adapter//[[:space:]]/}"
+    [ -n "$adapter" ] || continue
+    if [ "$adapter" = "none" ]; then
+      log "Adapter 'none' cannot be combined with another adapter ID."
+      exit 1
+    fi
+    python3 "$INSTALL_DIR/roc_adapter_runtime.py" \
+      --adapter-root "$INSTALL_DIR/adapters" validate --adapter "$adapter" >/dev/null
+    adapter_dir="$INSTALL_DIR/adapters/$adapter"
+    install_script="$adapter_dir/install.sh"
+    if [ -f "$install_script" ]; then
+      chmod +x "$install_script"
+      log "Installing optional adapter: $adapter"
+      "$install_script" "$SERVER_URL"
+    else
+      log "Adapter $adapter requires no additional installation."
+    fi
   done
 }
 
@@ -124,6 +107,30 @@ scheme = u.scheme or "http"
 host = u.hostname or ""
 port = u.port or (443 if scheme == "https" else 80)
 print(f"{host} {port}")
+PY
+}
+
+validate_install_paths() {
+  python3 - "$INSTALL_DIR" "$SDK_HOME" "${ROC_SDK_SOURCE_DIR:-}" <<'PY'
+import pathlib
+import sys
+
+
+def paths_overlap(first, second):
+    return first == second or first in second.parents or second in first.parents
+
+
+install_dir = pathlib.Path(sys.argv[1]).expanduser().resolve()
+sdk_home = pathlib.Path(sys.argv[2]).expanduser().resolve()
+home_dir = pathlib.Path.home().resolve()
+if install_dir in {pathlib.Path("/"), home_dir}:
+    raise SystemExit(f"unsafe ROC_SDK_INSTALL_DIR: {install_dir}")
+if paths_overlap(install_dir, sdk_home):
+    raise SystemExit("ROC_SDK_INSTALL_DIR and ROC_SDK_HOME must not overlap")
+if sys.argv[3]:
+    source_dir = pathlib.Path(sys.argv[3]).expanduser().resolve()
+    if paths_overlap(install_dir, source_dir):
+        raise SystemExit("ROC_SDK_INSTALL_DIR and ROC_SDK_SOURCE_DIR must not overlap")
 PY
 }
 
@@ -190,7 +197,8 @@ wait_for_apt_locks() {
   while fuser $locks >/dev/null 2>&1; do
     if [ "$waited" -ge "$max_wait" ]; then
       log "APT/dpkg is still locked after ${max_wait}s."
-      log "Another update process may be running. Please wait or reboot the robot, then rerun the same one-line command."
+      log "Another update process may be running."
+      log "Wait or reboot the robot, then rerun the same install command."
       exit 1
     fi
     log "APT/dpkg is busy. Waiting 10s... (${waited}/${max_wait}s)"
@@ -273,7 +281,8 @@ install_dependencies_if_needed() {
     fi
     if [ -n "$missing_tpm" ]; then
       if [ "$SOFTWARE_IDENTITY_ENV" = "1" ] && [ "${ROC_INSTALL_TPM_TOOLS:-0}" != "1" ]; then
-        log "TPM commands are optional on detected Go2/software identity devices. Set ROC_INSTALL_TPM_TOOLS=1 to install them anyway."
+        log "TPM commands are optional because software identity is enabled."
+        log "Set ROC_INSTALL_TPM_TOOLS=1 to install TPM tools anyway."
       else
         log "Installing TPM tools for industrial identity."
         [ -z "$missing" ] && apt_get_resilient update
@@ -289,9 +298,11 @@ install_dependencies_if_needed() {
 }
 
 run_sdk_bind() {
-  log "Binding adaptive device identity..."
+  log "Binding robot device identity..."
   RUN_SERVICE_AS_ROOT=0
-  ROC_ALLOW_SOFTWARE_IDENTITY="$SOFTWARE_IDENTITY_ENV" "$INSTALL_DIR/roc-robot-tpm-sdk.sh" bind "$SDK_BINDING_TOKEN" "$SERVER_URL"
+  ROC_ALLOW_SOFTWARE_IDENTITY="$SOFTWARE_IDENTITY_ENV" \
+    "$INSTALL_DIR/roc-robot-tpm-sdk.sh" \
+    bind "$SDK_BINDING_TOKEN" "$SERVER_URL"
 }
 
 stop_existing_agent() {
@@ -306,65 +317,6 @@ stop_existing_agent() {
   fi
 }
 
-detect_go2_network_interface() {
-  local iface="${ROC_GO2_NETWORK_INTERFACE:-}"
-  if [ -z "$iface" ] && require_cmd ip; then
-    iface="$(ip route get 192.168.123.161 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')"
-  fi
-  if [ -z "$iface" ] && require_cmd ip; then
-    iface="$(ip -br addr 2>/dev/null | awk '$3 ~ /^192\.168\.123\./ {print $1; exit}')"
-  fi
-  if [ -z "$iface" ] && require_cmd ip; then
-    iface="$(ip -br link 2>/dev/null | awk '$1 == "wlan0" && $2 == "UP" {print $1; exit}')"
-  fi
-  if [ -z "$iface" ] && require_cmd ip; then
-    iface="$(ip route 2>/dev/null | awk '$1 == "default" {print $5; exit}')"
-  fi
-  printf '%s\n' "${iface:-eth0}"
-}
-
-find_unitree_sdk_dir() {
-  local candidate
-  for candidate in \
-    "${ROC_UNITREE_SDK_DIR:-}" \
-    "$HOME/Downloads/sdk/unitree_sdk2" \
-    "$HOME/unitree_sdk2" \
-    /opt/unitree_sdk2; do
-    if [ -n "$candidate" ] && [ -f "$candidate/include/unitree/robot/go2/sport/sport_client.hpp" ]; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
-  return 1
-}
-
-build_go2_action_helper_if_possible() {
-  if ! detect_go2_or_orin || [ ! -f "$INSTALL_DIR/go2_helper/CMakeLists.txt" ]; then
-    return 0
-  fi
-
-  local sdk_dir
-  sdk_dir="$(find_unitree_sdk_dir || true)"
-  if [ -z "$sdk_dir" ]; then
-    log "Warning: Unitree SDK2 was not found; Go2 physical action helper was not built."
-    return 0
-  fi
-
-  if ! require_cmd cmake || ! require_cmd g++; then
-    if require_cmd apt-get && [ "${ROC_SKIP_DEP_INSTALL:-0}" != "1" ]; then
-      log "Installing Go2 action helper build dependencies."
-      apt_get_resilient update
-      apt_get_resilient install -y cmake g++ make
-    else
-      log "Warning: cmake/g++ missing; Go2 physical action helper was not built."
-      return 0
-    fi
-  fi
-
-  log "Building Go2 action, LiDAR navigation, and planner test binaries with SDK: $sdk_dir"
-  cmake -S "$INSTALL_DIR/go2_helper" -B "$INSTALL_DIR/go2_helper/build" -DUNITREE_SDK_DIR="$sdk_dir"
-  cmake --build "$INSTALL_DIR/go2_helper/build" --parallel 2
-}
 read_robot_id() {
   local robot_id_file="$SDK_HOME/robot-id"
   if [ -f "$robot_id_file" ]; then
@@ -380,63 +332,6 @@ try:
 except Exception:
     print("")
 '
-}
-
-backup_go2_bridge_if_present() {
-  mkdir -p "$SDK_HOME"
-  if [ -f "$INSTALL_DIR/go2_bridge.py" ]; then
-    cp "$INSTALL_DIR/go2_bridge.py" "$SDK_HOME/go2_bridge.py.pre-install-backup"
-    log "Existing Go2 bridge backed up before SDK refresh."
-  fi
-}
-
-restore_go2_bridge_if_needed() {
-  if [ -f "$INSTALL_DIR/go2_bridge.py" ]; then
-    chmod +x "$INSTALL_DIR/go2_bridge.py" || true
-    log "Using the current Go2 bridge from the SDK repository."
-    return 0
-  fi
-  if [ -f "$SDK_HOME/go2_bridge.py.pre-install-backup" ]; then
-    cp "$SDK_HOME/go2_bridge.py.pre-install-backup" "$INSTALL_DIR/go2_bridge.py"
-    chmod +x "$INSTALL_DIR/go2_bridge.py" || true
-    log "Go2 bridge restored from backup because the repository copy is missing."
-    return 0
-  fi
-  return 1
-}
-
-repair_go2_bridge_service_if_present() {
-  if ! require_cmd systemctl || [ ! -d /run/systemd/system ]; then
-    return 0
-  fi
-  if [ ! -f "/etc/systemd/system/${BRIDGE_SERVICE_NAME}.service" ] && ! systemctl list-unit-files "${BRIDGE_SERVICE_NAME}.service" >/dev/null 2>&1; then
-    return 0
-  fi
-  log "Detected existing Go2 bridge service; ensuring bridge file and service health."
-  local go2_network_interface
-  go2_network_interface="$(detect_go2_network_interface)"
-  log "Go2 bridge network interface: $go2_network_interface"
-  if require_cmd sudo && [ -f "/etc/systemd/system/${BRIDGE_SERVICE_NAME}.service" ]; then
-    sudo sed -i -E "s#--server[[:space:]]+[^[:space:]]+#--server ${SERVER_URL}#g" "/etc/systemd/system/${BRIDGE_SERVICE_NAME}.service" || true
-    sudo sed -i -E "s/--network[[:space:]]+[^[:space:]]+/--network ${go2_network_interface}/g" "/etc/systemd/system/${BRIDGE_SERVICE_NAME}.service" || true
-  fi
-  if ! restore_go2_bridge_if_needed; then
-    log "Warning: ${BRIDGE_SERVICE_NAME}.service exists but go2_bridge.py is missing. Install the Go2 integration package to restore physical action support."
-    return 0
-  fi
-  if require_cmd sudo; then
-    sudo systemctl daemon-reload || true
-    sudo systemctl restart "$BRIDGE_SERVICE_NAME" || true
-    for i in 1 2 3 4 5; do
-      if curl -fsS --connect-timeout 2 http://127.0.0.1:8080/api/v1/status >/dev/null 2>&1; then
-        log "Go2 bridge health check OK."
-        return 0
-      fi
-      sleep 2
-    done
-    log "Warning: Go2 bridge health check failed after restart. Recent logs:"
-    sudo journalctl -u "$BRIDGE_SERVICE_NAME" -n 80 --no-pager || true
-  fi
 }
 
 install_systemd_service() {
@@ -459,7 +354,13 @@ install_systemd_service() {
     printf '%s\n' "$robot_id" > "$SDK_HOME/robot-id"
     printf '%s\n' "$SERVER_URL" > "$SDK_HOME/server-url"
     rm -f "$SDK_HOME/output/heartbeat-server-response.json"
-    nohup env ROC_SDK_HOME="$SDK_HOME" ROC_SERVER_URL="$SERVER_URL" ROC_ALLOW_SOFTWARE_IDENTITY="$SOFTWARE_IDENTITY_ENV" "$INSTALL_DIR/roc-robot-tpm-sdk.sh" agent "$robot_id" "$SERVER_URL" > "$SDK_HOME/agent.log" 2>&1 &
+    nohup env \
+      ROC_SDK_HOME="$SDK_HOME" \
+      ROC_SERVER_URL="$SERVER_URL" \
+      ROC_ALLOW_SOFTWARE_IDENTITY="$SOFTWARE_IDENTITY_ENV" \
+      "$INSTALL_DIR/roc-robot-tpm-sdk.sh" \
+      agent "$robot_id" "$SERVER_URL" \
+      > "$SDK_HOME/agent.log" 2>&1 &
     log "Agent started in background. Log: $SDK_HOME/agent.log"
     return 0
   fi
@@ -469,7 +370,13 @@ install_systemd_service() {
     printf '%s\n' "$robot_id" > "$SDK_HOME/robot-id"
     printf '%s\n' "$SERVER_URL" > "$SDK_HOME/server-url"
     rm -f "$SDK_HOME/output/heartbeat-server-response.json"
-    nohup env ROC_SDK_HOME="$SDK_HOME" ROC_SERVER_URL="$SERVER_URL" ROC_ALLOW_SOFTWARE_IDENTITY="$SOFTWARE_IDENTITY_ENV" "$INSTALL_DIR/roc-robot-tpm-sdk.sh" agent "$robot_id" "$SERVER_URL" > "$SDK_HOME/agent.log" 2>&1 &
+    nohup env \
+      ROC_SDK_HOME="$SDK_HOME" \
+      ROC_SERVER_URL="$SERVER_URL" \
+      ROC_ALLOW_SOFTWARE_IDENTITY="$SOFTWARE_IDENTITY_ENV" \
+      "$INSTALL_DIR/roc-robot-tpm-sdk.sh" \
+      agent "$robot_id" "$SERVER_URL" \
+      > "$SDK_HOME/agent.log" 2>&1 &
     log "Agent started in background. Log: $SDK_HOME/agent.log"
     return 0
   fi
@@ -481,7 +388,7 @@ install_systemd_service() {
   log "Installing systemd service: $SERVICE_NAME.service"
   sudo tee "/etc/systemd/system/$SERVICE_NAME.service" >/dev/null <<SERVICE
 [Unit]
-Description=RoboCoin DeRAS SDK Agent
+Description=ROC Robot SDK Agent
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=120
@@ -494,6 +401,8 @@ WorkingDirectory=$INSTALL_DIR
 Environment=ROC_SDK_HOME=$SDK_HOME
 Environment=ROC_SERVER_URL=$SERVER_URL
 Environment=ROC_ALLOW_SOFTWARE_IDENTITY=$SOFTWARE_IDENTITY_ENV
+Environment=ROC_DEVICE_TYPE=${ROC_DEVICE_TYPE:-LINUX_ROBOT_AGENT}
+Environment=ROC_NETWORK_INTERFACE=${ROC_NETWORK_INTERFACE:-}
 Environment=ROC_HEARTBEAT_INTERVAL_SECONDS=${ROC_HEARTBEAT_INTERVAL_SECONDS:-30}
 Environment=ROC_AGENT_INTERVAL_SECONDS=${ROC_AGENT_INTERVAL_SECONDS:-3}
 ExecStart=$INSTALL_DIR/roc-robot-tpm-sdk.sh service $robot_id $SERVER_URL
@@ -573,20 +482,31 @@ log "Requested adapters: $ROC_ADAPTERS"
 
 configure_identity_policy
 install_dependencies_if_needed
+validate_install_paths
 check_system_time
 if [ "$TEST_MODE" != "1" ]; then
   wait_for_server_available
+  stop_existing_agent
 else
-  log "Test mode: skipping server availability check."
+  log "Test mode: skipping server availability check and service changes."
 fi
-stop_existing_agent
 mkdir -p "$SDK_HOME"
 
-if [ -d "$INSTALL_DIR/.git" ]; then
+if [ "$TEST_MODE" = "1" ] && [ -n "${ROC_SDK_SOURCE_DIR:-}" ]; then
+  if [ ! -f "$ROC_SDK_SOURCE_DIR/install.sh" ]; then
+    log "ROC_SDK_SOURCE_DIR is not an SDK source tree: $ROC_SDK_SOURCE_DIR"
+    exit 1
+  fi
+  log "Test mode: copying current SDK source from $ROC_SDK_SOURCE_DIR"
+  rm -rf "$INSTALL_DIR"
+  mkdir -p "$INSTALL_DIR"
+  cp -a "$ROC_SDK_SOURCE_DIR/." "$INSTALL_DIR/"
+elif [ -d "$INSTALL_DIR/.git" ]; then
   log "SDK directory exists. Pulling latest version..."
   if ! git -C "$INSTALL_DIR" pull --ff-only; then
     BACKUP_DIR="${INSTALL_DIR}.backup.$(date +%Y%m%d%H%M%S)"
-    log "Existing SDK directory has local changes or pull failed. Backing it up to: $BACKUP_DIR"
+    log "Existing SDK directory has local changes or pull failed."
+    log "Backing it up to: $BACKUP_DIR"
     mv "$INSTALL_DIR" "$BACKUP_DIR"
     log "Cloning SDK repository again..."
     git clone "$DEFAULT_REPO_URL" "$INSTALL_DIR"
@@ -598,10 +518,15 @@ else
 fi
 
 chmod +x "$INSTALL_DIR/roc-robot-tpm-sdk.sh"
-chmod +x "$INSTALL_DIR/adapters/go2/install.sh" 2>/dev/null || true
+chmod +x "$INSTALL_DIR/roc_adapter_runtime.py"
+find "$INSTALL_DIR/adapters" -type f \( -name '*.py' -o -name 'install.sh' \) \
+  -exec chmod +x {} + 2>/dev/null || true
 
 mkdir -p "$SDK_HOME"
 install_requested_adapters
+python3 "$INSTALL_DIR/roc_adapter_runtime.py" \
+  --adapter-root "$INSTALL_DIR/adapters" activate --adapters "$ROC_ADAPTERS" \
+  >/dev/null
 if [ "$TEST_MODE" = "1" ]; then
   log "Test mode: Core files and optional adapter selection validated; binding and service start skipped."
   exit 0

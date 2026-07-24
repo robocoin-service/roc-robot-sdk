@@ -1,0 +1,19 @@
+{
+  "$schema": "../schemas/job.schema.json",
+  "schemaVersion": "roc.job.v1",
+  "id": "mock-delivery-001",
+  "idempotencyKey": "mock-delivery-001",
+  "type": "DELIVERY",
+  "requiredCapabilities": [
+    "motion.linear",
+    "navigation.obstacle-avoidance"
+  ],
+  "parameters": {
+    "distanceMeters": 5,
+    "durationSeconds": 0.25
+  },
+  "safetyPolicy": {
+    "cancelOnTimeout": true,
+    "requiresOperatorOverride": false
+  }
+}

@@ -20,22 +20,35 @@ logging.basicConfig(
 )
 logger = logging.getLogger('go2_bridge')
 
-parser = argparse.ArgumentParser(description='Unitree Go2 & DeRAS SDK Local Bridge')
-parser.add_argument('--server', type=str, default='http://172.16.18.187:8090', help='Real DeRAS Server URL')
-parser.add_argument('--host', type=str, default='0.0.0.0', help='Bridge listen host')
+parser = argparse.ArgumentParser(description='Unitree Go2 local action bridge')
+parser.add_argument(
+    '--server', type=str, default='http://127.0.0.1:8090', help='Upstream ROC service URL'
+)
+parser.add_argument('--host', type=str, default='127.0.0.1', help='Bridge listen host')
 parser.add_argument('--port', type=int, default=8080, help='Bridge listen port')
 parser.add_argument('--mock', action='store_true', default=False, help='Enable mock mode')
-parser.add_argument('--network', type=str, default=os.environ.get('ROC_GO2_NETWORK', 'eth0'), help='Network interface connected to Go2')
+parser.add_argument(
+    '--network',
+    type=str,
+    default=os.environ.get('ROC_GO2_NETWORK', 'eth0'),
+    help='Network interface connected to Go2',
+)
 args, unknown = parser.parse_known_args()
 
 REAL_SERVER_URL = args.server.rstrip('/')
 NETWORK_INTERFACE = args.network
 TINY_MOVE_BIN = '/home/unitree/go2_tiny_move/build/go2_tiny_move'
-TINY_MOVE_LD = '/home/unitree/Downloads/sdk/unitree_sdk2/thirdparty/lib/aarch64:/home/unitree/Downloads/sdk/unitree_sdk2/lib/aarch64'
-SDK_ACTION_HELPER_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'go2_helper', 'build', 'go2_action_helper')
-OBSTACLE_AVOID_HELPER_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'go2_helper', 'build', 'go2_obstacle_move')
-LIDAR_NAV_HELPER_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'go2_helper', 'build', 'go2_lidar_navigator')
-CAMERA_PROBE_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'go2_helper', 'build', 'go2_camera_probe')
+TINY_MOVE_LD = (
+    '/home/unitree/Downloads/sdk/unitree_sdk2/thirdparty/lib/aarch64:'
+    '/home/unitree/Downloads/sdk/unitree_sdk2/lib/aarch64'
+)
+HELPER_BUILD_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'go2_helper', 'build'
+)
+SDK_ACTION_HELPER_BIN = os.path.join(HELPER_BUILD_DIR, 'go2_action_helper')
+OBSTACLE_AVOID_HELPER_BIN = os.path.join(HELPER_BUILD_DIR, 'go2_obstacle_move')
+LIDAR_NAV_HELPER_BIN = os.path.join(HELPER_BUILD_DIR, 'go2_lidar_navigator')
+CAMERA_PROBE_BIN = os.path.join(HELPER_BUILD_DIR, 'go2_camera_probe')
 LINEAR_RAMP_MS = 800
 
 
@@ -510,7 +523,11 @@ else:
                         'data': {'action': normalized, 'meters': distance},
                     }
                 if normalized == 'patrol_inspection':
-                    threading.Thread(target=self._run_patrol_inspection, args=(meters or 10.0, seconds or 9.0), daemon=True).start()
+                    threading.Thread(
+                        target=self._run_patrol_inspection,
+                        args=(meters or 10.0, seconds or 9.0),
+                        daemon=True,
+                    ).start()
                     return {'code': 200, 'message': 'Mock patrol inspection started', 'data': {'action': normalized}}
                 time.sleep(float(seconds or 2.0))
                 self.state = 'ACTION_DONE'
@@ -520,8 +537,20 @@ else:
                 if self._motion_is_active():
                     self.state = 'ACTION_RUNNING'
                     return {'code': 409, 'message': 'A Go2 motion action is already running'}
-                threading.Thread(target=self._run_patrol_inspection, args=(meters or 10.0, seconds or 9.0), daemon=True).start()
-                return {'code': 200, 'message': 'Go2 patrol inspection started', 'data': {'action': normalized, 'meters': meters or 10.0, 'turnSeconds': seconds or 9.0}}
+                threading.Thread(
+                    target=self._run_patrol_inspection,
+                    args=(meters or 10.0, seconds or 9.0),
+                    daemon=True,
+                ).start()
+                return {
+                    'code': 200,
+                    'message': 'Go2 patrol inspection started',
+                    'data': {
+                        'action': normalized,
+                        'meters': meters or 10.0,
+                        'turnSeconds': seconds or 9.0,
+                    },
+                }
             if normalized == 'stop':
                 output = self._stop_sport_motion()
             elif normalized in ('move_forward', 'move_backward', 'navigate_forward_avoid'):
@@ -544,7 +573,11 @@ else:
                 raise RuntimeError('No executor configured for Go2 action: %s' % normalized)
 
             self.state = 'ACTION_DONE'
-            return {'code': 200, 'message': 'Go2 action %s finished' % normalized, 'data': {'action': normalized, 'output': output}}
+            return {
+                'code': 200,
+                'message': 'Go2 action %s finished' % normalized,
+                'data': {'action': normalized, 'output': output},
+            }
         except Exception as exc:
             self.state = 'ERROR'
             self.error_msg = 'Go2 action failed: %s' % exc
@@ -672,12 +705,18 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         except Exception as exc:
             logger.exception('Proxy failed: %s', target)
-            self._send_json({'code': 502, 'message': 'DeRAS Server unreachable: %s' % exc}, 502)
+            self._send_json({'code': 502, 'message': 'Upstream ROC service unreachable: %s' % exc}, 502)
 
 
 if __name__ == '__main__':
     server = ThreadingHTTPServer((args.host, args.port), BridgeHandler)
-    logger.info('Go2 bridge listening on %s:%s, proxy=%s, network=%s', args.host, args.port, REAL_SERVER_URL, NETWORK_INTERFACE)
+    logger.info(
+        'Go2 bridge listening on %s:%s, proxy=%s, network=%s',
+        args.host,
+        args.port,
+        REAL_SERVER_URL,
+        NETWORK_INTERFACE,
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
