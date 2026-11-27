@@ -5,7 +5,7 @@ SDK source: https://github.com/robocoin-service/roc-robot-sdk
 
 
 Purpose
-- Read the TPM business public key and EK public key.
+- Read the TPM signing public key. This SDK does not provision EK attestation.
 - Ask the TPM private key to sign a challenge payload.
 - Submit robotId, ownerUserId, sdkBindingToken, CPU/TPM information, public key fingerprint and signature to roc-server.
 - Keep a TPM-signed heartbeat with DeRAS so the platform can see whether the robot Agent is online.
@@ -29,35 +29,24 @@ The installer clones the SDK repository, installs dependencies if apt-get is ava
 
 
 One-step local command after clone
-./roc-robot-tpm-sdk.sh bind <sdkBindingToken> [serverUrl] [tpmHandle]
-
-
-Register command
-./roc-robot-tpm-sdk.sh register <robotId> <ownerUserId> <serverUrl> <sdkBindingToken> [tpmHandle]
-
-
-Legacy register command is still supported:
-./roc-robot-tpm-sdk.sh <robotId> <ownerUserId> <serverUrl> <sdkBindingToken> [tpmHandle]
-
-
-Example
-./roc-robot-tpm-sdk.sh register 12 3 http://your-server:8090 8a7f2c4e9d7b4c0aa123456789abcdef
+bash roc-robot-tpm-sdk.sh bind <sdkBindingToken> [serverUrl] [tpmHandle]
+Binding alone does not install the service. The default API base is https://deras.robocoin.io.
 
 
 Stage verification command
-./roc-robot-tpm-sdk.sh stage <serverUrl> <verificationId> <orderId> <taskId> <robotId> <stage> <nonce> <challengePayload> [tpmHandle]
+bash roc-robot-tpm-sdk.sh stage <serverUrl> <verificationId> <orderId> <taskId> <robotId> <stage> <nonce> <challengePayload> [tpmHandle]
 
 
 Stage example
-./roc-robot-tpm-sdk.sh stage http://your-server:8090 7 21 13 12 DEPARTED abc123 "orderId=21;taskId=13;robotId=12;..."
+bash roc-robot-tpm-sdk.sh stage http://your-server:8090 7 21 13 12 DEPARTED abc123 "orderId=21;taskId=13;robotId=12;..."
 
 
 Agent command
-./roc-robot-tpm-sdk.sh agent <robotId> [serverUrl] [tpmHandle]
+bash roc-robot-tpm-sdk.sh agent <robotId> [serverUrl] [tpmHandle]
 
 
 Agent example
-./roc-robot-tpm-sdk.sh agent 12
+bash roc-robot-tpm-sdk.sh agent 12
 
 
 Agent behavior
@@ -71,3 +60,7 @@ Service commands
 sudo systemctl status roc-robot-agent
 sudo systemctl restart roc-robot-agent
 sudo journalctl -u roc-robot-agent -f
+
+Read-only diagnostics: bash ~/roc-robot-sdk/roc-robot-tpm-sdk.sh doctor --json
+This reports the local binding and heartbeat state without including identifying details.
+Use DeRAS to confirm current online status before testing real hardware.

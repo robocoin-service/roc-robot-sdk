@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SDK_VERSION="0.19.0-filtered-fast-motion"
-DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://172.16.18.187:8090}"
+SDK_VERSION="1.1.0"
+DEFAULT_SERVER_URL="${ROC_SERVER_URL:-https://deras.robocoin.io}"
 MODE="${1:-}"
 SDK_HOME="${ROC_SDK_HOME:-$HOME/.roc-robot-sdk}"
-SERVICE_NAME="${ROC_SDK_SERVICE_NAME:-roc-robot-agent}"
+SDK_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR="$SDK_HOME/tpm"
 OUTPUT_DIR="$SDK_HOME/output"
-mkdir -p "$WORK_DIR" "$OUTPUT_DIR"
 
 log(){ printf '[ROC SDK] %s\n' "$1"; }
 has_cmd(){ command -v "$1" >/dev/null 2>&1; }
 need(){ has_cmd "$1" || { echo "missing command: $1" >&2; exit 1; }; }
-jv(){ python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' <<<"$1"; }
+jv(){ printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'; }
 sha(){ printf '%s' "$1" | sha256sum | awk '{print $1}'; }
 pubfp(){ openssl pkey -pubin -in "$1" -outform DER | sha256sum | awk '{print $1}'; }
 trim(){ [ -r "$1" ] && tr -d '\r\n' < "$1" 2>/dev/null || true; }
@@ -24,16 +23,27 @@ rand(){ openssl rand -hex 16 2>/dev/null || date +%s%N; }
 base(){ need openssl; need python3; need curl; need sha256sum; need base64; need lscpu; }
 
 case "$MODE" in
+  --version) printf '%s\n' "$SDK_VERSION"; exit 0 ;;
+  doctor)
+    if [ "${2:-}" = "--json" ]; then
+      exec python3 "$SDK_ROOT/sdk-checks.py" status "$SDK_HOME" "$SDK_VERSION" --json
+    fi
+    exec python3 "$SDK_ROOT/sdk-checks.py" status "$SDK_HOME" "$SDK_VERSION"
+    ;;
+  check-adapter) exec python3 "$SDK_ROOT/sdk-checks.py" check-adapter "${2:-.}" ;;
   bind|install) SDK_BINDING_TOKEN="${2:-}"; SERVER_URL="${3:-$DEFAULT_SERVER_URL}"; TPM_HANDLE="${4:-0x81010010}"; ROBOT_ID="" ;;
   service|agent) ROBOT_ID="${2:-}"; SERVER_URL="${3:-$DEFAULT_SERVER_URL}"; TPM_HANDLE="${4:-0x81010010}"; SDK_BINDING_TOKEN="" ;;
   stage) SERVER_URL="${2:-$DEFAULT_SERVER_URL}"; VERIFICATION_ID="${3:-}"; ORDER_ID="${4:-}"; TASK_ID="${5:-}"; ROBOT_ID="${6:-}"; STAGE="${7:-}"; NONCE="${8:-}"; CHALLENGE_PAYLOAD="${9:-}"; TPM_HANDLE="${10:-0x81010010}"; SDK_BINDING_TOKEN="" ;;
-  doctor) SERVER_URL="${2:-$DEFAULT_SERVER_URL}"; TPM_HANDLE="${3:-0x81010010}"; ROBOT_ID=""; SDK_BINDING_TOKEN="" ;;
-  *) echo "Usage: $0 bind <sdkBindingToken> [serverUrl] | service <robotId> [serverUrl] | agent <robotId> [serverUrl] | doctor [serverUrl]" >&2; exit 1 ;;
+  -h|--help|"") echo "Usage: bash $0 bind <sdkBindingToken> [serverUrl] | agent <robotId> [serverUrl] | doctor [--json] | check-adapter <directory> | --version"; exit 0 ;;
+  *) echo "Unknown SDK command. Run with --help for usage." >&2; exit 1 ;;
 esac
 
-if [ "$MODE" = "doctor" ] && [ -z "${2:-}" ] && [ -f "$SDK_HOME/server-url" ]; then
-  SERVER_URL="$(trim "$SDK_HOME/server-url")"
-fi
+umask 077
+mkdir -p "$WORK_DIR" "$OUTPUT_DIR"
+SCRATCH_DIR="$(mktemp -d "$WORK_DIR/session.XXXXXXXX")"
+trap 'rm -f "$SCRATCH_DIR/payload.txt" "$SCRATCH_DIR/signature.bin" "$SCRATCH_DIR/device-report.json"; rmdir "$SCRATCH_DIR"' EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 collect(){
   COMPUTER_NAME="$(hostname 2>/dev/null || echo unknown)"
@@ -108,12 +118,12 @@ prepare(){
 }
 
 sign(){
-  if [ "$IDENTITY_MODE" = "TPM" ]; then tpm2_sign -c "$TPM_HANDLE" -g sha256 -s rsassa -f plain -o "$WORK_DIR/signature.bin" "$WORK_DIR/payload.txt"; else openssl dgst -sha256 -sign "$KEY_PRIV" -out "$WORK_DIR/signature.bin" "$WORK_DIR/payload.txt"; fi
-  openssl dgst -sha256 -verify "$KEY_PEM" -signature "$WORK_DIR/signature.bin" "$WORK_DIR/payload.txt" >/dev/null
-  base64 -w 0 "$WORK_DIR/signature.bin" 2>/dev/null || base64 "$WORK_DIR/signature.bin" | tr -d '\n'
+  if [ "$IDENTITY_MODE" = "TPM" ]; then tpm2_sign -c "$TPM_HANDLE" -g sha256 -s rsassa -f plain -o "$SCRATCH_DIR/signature.bin" "$SCRATCH_DIR/payload.txt"; else openssl dgst -sha256 -sign "$KEY_PRIV" -out "$SCRATCH_DIR/signature.bin" "$SCRATCH_DIR/payload.txt"; fi
+  openssl dgst -sha256 -verify "$KEY_PEM" -signature "$SCRATCH_DIR/signature.bin" "$SCRATCH_DIR/payload.txt" >/dev/null
+  base64 -w 0 "$SCRATCH_DIR/signature.bin" 2>/dev/null || base64 -i "$SCRATCH_DIR/signature.bin" | tr -d '\n'
 }
 
-post(){ curl -sS -H 'Content-Type: application/json; charset=utf-8' --data-binary "@$1" "$2" || true; }
+post(){ curl -fsS --connect-timeout 5 --max-time 20 -H 'Content-Type: application/json; charset=utf-8' --data-binary "@$1" "$2" || true; }
 
 detect_go2_bridge_url(){
   local server_host server_ip route_line source_ip bridge_port
@@ -145,66 +155,29 @@ heartbeat(){
   at="$(date '+%Y-%m-%d %H:%M:%S')"; nonce="$(date +%s%N)-$(rand)"; interval="${ROC_HEARTBEAT_INTERVAL_SECONDS:-30}"
   go2_bridge_url="$(detect_go2_bridge_url)"
   payload="event=HEARTBEAT;robotId=$ROBOT_ID;publicKeyFingerprint=$PUBLIC_KEY_FINGERPRINT;machineFingerprint=$MACHINE_FINGERPRINT;sdkVersion=$SDK_VERSION;go2BridgeUrl=$go2_bridge_url;nonce=$nonce;heartbeatAt=$at"
-  printf '%s' "$payload" > "$WORK_DIR/payload.txt"; sig="$(sign)"
+  printf '%s' "$payload" > "$SCRATCH_DIR/payload.txt"; sig="$(sign)"
   cat > "$OUTPUT_DIR/heartbeat-report.json" <<JSON
 {"robotId":$ROBOT_ID,"sdkVersion":$(jv "$SDK_VERSION"),"deviceType":"LINUX_GO2_ADAPTIVE_ROBOT","computerName":$(jv "$COMPUTER_NAME"),"cpuModel":$(jv "$CPU_MODEL"),"machineFingerprint":$(jv "$MACHINE_FINGERPRINT"),"publicKeyFingerprint":$(jv "$PUBLIC_KEY_FINGERPRINT"),"platformIdentityType":$(jv "$PLATFORM_IDENTITY_TYPE"),"platformIdentityFingerprint":$(jv "$PLATFORM_IDENTITY_FINGERPRINT"),"go2NetworkInterface":$(jv "$GO2_NETWORK_INTERFACE"),"go2BridgeUrl":$(jv "$go2_bridge_url"),"go2SdkDetected":$GO2_SDK_DETECTED,"go2StateReadable":$GO2_STATE_READABLE,"heartbeatAt":$(jv "$at"),"heartbeatIntervalSeconds":$interval,"nonce":$(jv "$nonce"),"signatureAlgorithm":"RSASSA-SHA256","signaturePrivateKey":$(jv "$SIGNATURE_PRIVATE_KEY_LABEL"),"signaturePayload":$(jv "$payload"),"signature":$(jv "$sig")}
 JSON
   resp="$(post "$OUTPUT_DIR/heartbeat-report.json" "${SERVER_URL%/}/user/sdkAgent/heartbeat")"; printf '%s\n' "$resp" > "$OUTPUT_DIR/heartbeat-server-response.json"
-  printf '%s' "$resp" | grep -q '"code":200' && log "Heartbeat verified at $at" || log "Heartbeat failed: $resp"
+  if python3 "$SDK_ROOT/sdk-checks.py" heartbeat "$OUTPUT_DIR/heartbeat-server-response.json" "$ROBOT_ID"; then
+    log "Heartbeat verified at $at"
+  else
+    log "Heartbeat not verified. Check connectivity and device confirmation in DeRAS."
+  fi
 }
 
 stage_report(){
-  payload="$CHALLENGE_PAYLOAD"; printf '%s' "$payload" > "$WORK_DIR/payload.txt"; sig="$(sign)"
+  payload="$CHALLENGE_PAYLOAD"; printf '%s' "$payload" > "$SCRATCH_DIR/payload.txt"; sig="$(sign)"
   cat > "$OUTPUT_DIR/stage-report.json" <<JSON
 {"verificationId":$VERIFICATION_ID,"orderId":$ORDER_ID,"taskId":$TASK_ID,"robotId":$ROBOT_ID,"stage":$(jv "$STAGE"),"nonce":$(jv "$NONCE"),"sdkVersion":$(jv "$SDK_VERSION"),"deviceType":"LINUX_GO2_ADAPTIVE_ROBOT","publicKeyFingerprint":$(jv "$PUBLIC_KEY_FINGERPRINT"),"signatureAlgorithm":"RSASSA-SHA256","signaturePrivateKey":$(jv "$SIGNATURE_PRIVATE_KEY_LABEL"),"signaturePayload":$(jv "$payload"),"signature":$(jv "$sig"),"computerName":$(jv "$COMPUTER_NAME"),"cpuModel":$(jv "$CPU_MODEL"),"machineFingerprint":$(jv "$MACHINE_FINGERPRINT"),"platformIdentityType":$(jv "$PLATFORM_IDENTITY_TYPE"),"platformIdentityFingerprint":$(jv "$PLATFORM_IDENTITY_FINGERPRINT"),"go2NetworkInterface":$(jv "$GO2_NETWORK_INTERFACE"),"go2SdkDetected":$GO2_SDK_DETECTED,"go2StateReadable":$GO2_STATE_READABLE,"collectedAt":$(jv "$COLLECTED_AT")}
 JSON
 }
 
-doctor_summary(){
-  echo "[ROC SDK DOCTOR] Version: $SDK_VERSION"
-  echo "[ROC SDK DOCTOR] SDK home: $SDK_HOME"
-  echo "[ROC SDK DOCTOR] Server URL: $SERVER_URL"
-  echo "[ROC SDK DOCTOR] Go2 bridge URL: $(detect_go2_bridge_url)"
-  [ -f "$SDK_HOME/robot-id" ] && echo "[ROC SDK DOCTOR] Robot ID: $(cat "$SDK_HOME/robot-id")" || echo "[ROC SDK DOCTOR] Robot ID: missing"
-  echo "[ROC SDK DOCTOR] Time: $(date 2>/dev/null || true)"
-  echo "[ROC SDK DOCTOR] Hostname: $(hostname 2>/dev/null || echo unknown)"
-  echo "[ROC SDK DOCTOR] Kernel: $(uname -a 2>/dev/null || true)"
-
-  if has_cmd ip; then
-    echo "[ROC SDK DOCTOR] Network interfaces:"
-    ip -br addr 2>/dev/null || true
-    echo "[ROC SDK DOCTOR] Default route:"
-    ip route show default 2>/dev/null || true
-  fi
-
-  echo "[ROC SDK DOCTOR] SDK processes:"
-  ps -ef 2>/dev/null | grep 'roc-robot-tpm-sdk.sh' | grep -v grep || true
-
-  if has_cmd systemctl && [ -d /run/systemd/system ]; then
-    echo "[ROC SDK DOCTOR] Service status: $SERVICE_NAME"
-    systemctl --no-pager --full status "$SERVICE_NAME" 2>/dev/null | sed -n '1,18p' || true
-  fi
-
-  echo "[ROC SDK DOCTOR] Identity files:"
-  ls -l "$WORK_DIR"/*signing*.pem "$WORK_DIR"/robocoin-signing-public.pem 2>/dev/null || true
-
-  echo "[ROC SDK DOCTOR] Last bind response:"
-  [ -f "$OUTPUT_DIR/server-response.json" ] && cat "$OUTPUT_DIR/server-response.json" || true
-  echo
-  echo "[ROC SDK DOCTOR] Last heartbeat response:"
-  [ -f "$OUTPUT_DIR/heartbeat-server-response.json" ] && cat "$OUTPUT_DIR/heartbeat-server-response.json" || true
-  echo
-  echo "[ROC SDK DOCTOR] Last stage response:"
-  [ -f "$OUTPUT_DIR/stage-server-response.json" ] && cat "$OUTPUT_DIR/stage-server-response.json" || true
-  echo
-
-  if [ -f "$SDK_HOME/agent.log" ]; then
-    echo "[ROC SDK DOCTOR] Last agent.log lines:"
-    tail -40 "$SDK_HOME/agent.log" || true
-  fi
-}
-
-if [ "$MODE" = "doctor" ]; then doctor_summary; exit 0; fi
+case "$MODE" in
+  bind|install) [ -n "$SDK_BINDING_TOKEN" ] || { echo "DeRAS binding token is required." >&2; exit 1; } ;;
+  service|agent|stage) [[ "$ROBOT_ID" =~ ^[1-9][0-9]*$ ]] || { echo "A valid robot ID is required." >&2; exit 1; } ;;
+esac
 prepare
 
 if [ "$MODE" = "service" ] || [ "$MODE" = "agent" ]; then
@@ -213,7 +186,7 @@ if [ "$MODE" = "service" ] || [ "$MODE" = "agent" ]; then
   while true; do
     now="$(date +%s)"; interval="${ROC_HEARTBEAT_INTERVAL_SECONDS:-30}"
     [ $((now-last)) -ge "$interval" ] && heartbeat && last="$now"
-    pending="$(curl -sS "${SERVER_URL%/}/user/sdkAgent/pendingChallenge?robotId=$ROBOT_ID&publicKeyFingerprint=$PUBLIC_KEY_FINGERPRINT" || true)"
+    pending="$(curl -fsS --connect-timeout 5 --max-time 10 "${SERVER_URL%/}/user/sdkAgent/pendingChallenge?robotId=$ROBOT_ID&publicKeyFingerprint=$PUBLIC_KEY_FINGERPRINT" || true)"
     has="$(printf '%s' "$pending" | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("data",{}).get("hasChallenge",False)).lower())' 2>/dev/null || echo false)"
     if [ "$has" = "true" ]; then
       tmp="$WORK_DIR/pending.json"; printf '%s' "$pending" > "$tmp"
@@ -235,13 +208,17 @@ if [ "$MODE" = "stage" ]; then stage_report; post "$OUTPUT_DIR/stage-report.json
 [ -n "$SDK_BINDING_TOKEN" ] || { echo "sdkBindingToken is required" >&2; exit 1; }
 nonce="$(date +%s%N)-$(rand)"
 payload="robotId=;ownerUserId=;sdkBindingToken=$SDK_BINDING_TOKEN;computerName=$COMPUTER_NAME;cpuModel=$CPU_MODEL;cpuManufacturer=$CPU_MANUFACTURER;cpuCores=$CPU_CORES;cpuLogicalProcessors=$CPU_LOGICAL;machineFingerprint=$MACHINE_FINGERPRINT;tpmManufacturer=$TPM_INFO;tpmPersistentHandle=$TPM_HANDLE_LABEL;publicKeyFingerprint=$PUBLIC_KEY_FINGERPRINT;ekPublicKeyFingerprint=$EK_PUBLIC_KEY_FINGERPRINT;platformIdentityType=$PLATFORM_IDENTITY_TYPE;platformIdentityFingerprint=$PLATFORM_IDENTITY_FINGERPRINT;go2NetworkInterface=$GO2_NETWORK_INTERFACE;challengeNonce=$nonce;collectedAt=$COLLECTED_AT"
-printf '%s' "$payload" > "$WORK_DIR/payload.txt"; sig="$(sign)"
-cat > "$OUTPUT_DIR/device-report.json" <<JSON
+printf '%s' "$payload" > "$SCRATCH_DIR/payload.txt"; sig="$(sign)"
+cat > "$SCRATCH_DIR/device-report.json" <<JSON
 {"robotId":null,"ownerUserId":null,"sdkBindingToken":$(jv "$SDK_BINDING_TOKEN"),"sdkVersion":$(jv "$SDK_VERSION"),"deviceType":"LINUX_GO2_ADAPTIVE_ROBOT","computerName":$(jv "$COMPUTER_NAME"),"cpuModel":$(jv "$CPU_MODEL"),"cpuManufacturer":$(jv "$CPU_MANUFACTURER"),"cpuProcessorId":$(jv "$CPU_MANUFACTURER-$CPU_MODEL"),"cpuCores":$CPU_CORES,"cpuLogicalProcessors":$CPU_LOGICAL,"cpuMaxClockMhz":$CPU_MAX_MHZ,"machineFingerprint":$(jv "$MACHINE_FINGERPRINT"),"platformIdentityType":$(jv "$PLATFORM_IDENTITY_TYPE"),"platformIdentityFingerprint":$(jv "$PLATFORM_IDENTITY_FINGERPRINT"),"deviceModel":$(jv "$DEVICE_MODEL"),"machineId":$(jv "$MACHINE_ID"),"orinEcid":$(jv "$ORIN_ECID"),"orinPublicKey":$(jv "$ORIN_PUBLIC_KEY"),"orinPublicKeyFingerprint":$(jv "$ORIN_PUBLIC_KEY_FINGERPRINT"),"orinBootSecurityInfo":$(jv "$ORIN_BOOT_SECURITY_INFO"),"orinCustomerOptinFuse":$(jv "$ORIN_CUSTOMER_OPTIN_FUSE"),"go2NetworkInterface":$(jv "$GO2_NETWORK_INTERFACE"),"unitreeSdk2Path":$(jv "$UNITREE_SDK2_PATH"),"unitreePythonSdkPath":$(jv "$UNITREE_PYTHON_SDK_PATH"),"go2SdkDetected":$GO2_SDK_DETECTED,"go2StateReadable":$GO2_STATE_READABLE,"go2StateSample":$(jv "$GO2_STATE_SAMPLE"),"tpmManufacturer":$(jv "$TPM_INFO"),"tpmPersistentHandle":$(jv "$TPM_HANDLE_LABEL"),"publicKeyPem":$(jv "$PUBLIC_KEY_PEM"),"publicKeyFingerprint":$(jv "$PUBLIC_KEY_FINGERPRINT"),"ekPublicKeyPem":$(jv "$EK_PUBLIC_KEY_PEM"),"ekPublicKeyFingerprint":$(jv "$EK_PUBLIC_KEY_FINGERPRINT"),"challengeNonce":$(jv "$nonce"),"signatureAlgorithm":"RSASSA-SHA256","signaturePrivateKey":$(jv "$SIGNATURE_PRIVATE_KEY_LABEL"),"signaturePayload":$(jv "$payload"),"signature":$(jv "$sig"),"collectedAt":$(jv "$COLLECTED_AT")}
 JSON
 log "Identity mode: $IDENTITY_MODE"; log "Public key fingerprint: $PUBLIC_KEY_FINGERPRINT"; log "Platform identity: $PLATFORM_IDENTITY_TYPE / $PLATFORM_IDENTITY_FINGERPRINT"
-resp="$(post "$OUTPUT_DIR/device-report.json" "${SERVER_URL%/}/user/robotSdkReport")"; printf '%s\n' "$resp" | tee "$OUTPUT_DIR/server-response.json"
-code="$(printf '%s' "$resp" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("code",""))' 2>/dev/null || true)"
-robot="$(printf '%s' "$resp" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("data",{}).get("robotId",""))' 2>/dev/null || true)"
-[ -n "$robot" ] && printf '%s\n' "$robot" > "$SDK_HOME/robot-id"
-[ "$code" = "200" ]
+resp="$(post "$SCRATCH_DIR/device-report.json" "${SERVER_URL%/}/user/robotSdkReport")"
+if ! robot="$(printf '%s' "$resp" | python3 "$SDK_ROOT/sdk-checks.py" bind)"; then
+  log "DeRAS did not return a verified binding. Check the robot record and the token expiry before retrying."
+  exit 1
+fi
+printf '%s\n' "$robot" > "$SDK_HOME/robot-id"
+printf '%s\n' "$SERVER_URL" > "$SDK_HOME/server-url"
+rm -f "$OUTPUT_DIR/heartbeat-server-response.json"
+log "DeRAS confirmed the signed device binding."

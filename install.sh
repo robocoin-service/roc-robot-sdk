@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SDK_VERSION="1.0.0-core-adapter"
-DEFAULT_SERVER_URL="${ROC_SERVER_URL:-http://172.16.18.187:8090}"
+SDK_VERSION="1.1.0"
+DEFAULT_SERVER_URL="${ROC_SERVER_URL:-https://deras.robocoin.io}"
 DEFAULT_REPO_URL="${ROC_SDK_REPO_URL:-https://github.com/robocoin-service/roc-robot-sdk.git}"
 INSTALL_DIR="${ROC_SDK_INSTALL_DIR:-$HOME/roc-robot-sdk}"
 SDK_HOME="${ROC_SDK_HOME:-$HOME/.roc-robot-sdk}"
@@ -29,7 +29,7 @@ Environment:
   ROC_SDK_HOME           SDK runtime directory. Default: $SDK_HOME
   ROC_SKIP_DEP_INSTALL   Set to 1 to skip dependency installation.
   ROC_DEVICE_PROFILE     generic | industrial. Default: generic.
-  ROC_ADAPTERS           Comma-separated optional adapters, for example: go2.
+  ROC_ADAPTERS           Optional adapter: none or go2.
                          Default: none. Core never installs a hardware adapter implicitly.
   ROC_SDK_TEST_MODE      Set to 1 for an offline Core installation smoke test.
   ROC_ALLOW_SOFTWARE_IDENTITY
@@ -291,18 +291,12 @@ install_dependencies_if_needed() {
 run_sdk_bind() {
   log "Binding adaptive device identity..."
   RUN_SERVICE_AS_ROOT=0
-  ROC_ALLOW_SOFTWARE_IDENTITY="$SOFTWARE_IDENTITY_ENV" "$INSTALL_DIR/roc-robot-tpm-sdk.sh" bind "$SDK_BINDING_TOKEN" "$SERVER_URL"
+  ROC_SDK_HOME="$SDK_HOME" ROC_ALLOW_SOFTWARE_IDENTITY="$SOFTWARE_IDENTITY_ENV" "$INSTALL_DIR/roc-robot-tpm-sdk.sh" bind "$SDK_BINDING_TOKEN" "$SERVER_URL"
 }
 
 stop_existing_agent() {
-  log "Stopping existing SDK agent/service if present..."
-  if require_cmd systemctl && [ -d /run/systemd/system ] && require_cmd sudo; then
-    sudo systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
-    sudo systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
-  fi
-  if require_cmd pkill; then
-    pkill -f 'roc-robot-tpm-sdk\.sh service' >/dev/null 2>&1 || true
-    pkill -f 'roc-robot-tpm-sdk\.sh agent' >/dev/null 2>&1 || true
+  if require_cmd systemctl && [ -d /run/systemd/system ] && systemctl is-active --quiet "$SERVICE_NAME"; then
+    sudo_cmd systemctl stop "$SERVICE_NAME"
   fi
 }
 
@@ -366,20 +360,7 @@ build_go2_action_helper_if_possible() {
   cmake --build "$INSTALL_DIR/go2_helper/build" --parallel 2
 }
 read_robot_id() {
-  local robot_id_file="$SDK_HOME/robot-id"
-  if [ -f "$robot_id_file" ]; then
-    tr -d '[:space:]' < "$robot_id_file"
-    return 0
-  fi
-
-  python3 -c 'import json, pathlib
-p = pathlib.Path("'"$SDK_HOME"'") / "output" / "server-response.json"
-try:
-    data = json.loads(p.read_text())
-    print(data.get("data", {}).get("robotId", ""))
-except Exception:
-    print("")
-'
+  tr -d '[:space:]' < "$SDK_HOME/robot-id"
 }
 
 backup_go2_bridge_if_present() {
@@ -455,23 +436,17 @@ install_systemd_service() {
   fi
 
   if ! require_cmd systemctl || [ ! -d /run/systemd/system ]; then
-    log "systemd is not available. Starting Agent with nohup."
+    log "systemd is not available. No service was started; run a single agent under your supervisor."
     printf '%s\n' "$robot_id" > "$SDK_HOME/robot-id"
     printf '%s\n' "$SERVER_URL" > "$SDK_HOME/server-url"
     rm -f "$SDK_HOME/output/heartbeat-server-response.json"
-    nohup env ROC_SDK_HOME="$SDK_HOME" ROC_SERVER_URL="$SERVER_URL" ROC_ALLOW_SOFTWARE_IDENTITY="$SOFTWARE_IDENTITY_ENV" "$INSTALL_DIR/roc-robot-tpm-sdk.sh" agent "$robot_id" "$SERVER_URL" > "$SDK_HOME/agent.log" 2>&1 &
-    log "Agent started in background. Log: $SDK_HOME/agent.log"
+    printf 'Run: ROC_SDK_HOME=%q ROC_ALLOW_SOFTWARE_IDENTITY=%q bash %q agent %q %q\n' "$SDK_HOME" "$SOFTWARE_IDENTITY_ENV" "$INSTALL_DIR/roc-robot-tpm-sdk.sh" "$robot_id" "$SERVER_URL"
     return 0
   fi
 
-  if ! require_cmd sudo; then
-    log "sudo is not available. Starting Agent with nohup."
-    printf '%s\n' "$robot_id" > "$SDK_HOME/robot-id"
-    printf '%s\n' "$SERVER_URL" > "$SDK_HOME/server-url"
-    rm -f "$SDK_HOME/output/heartbeat-server-response.json"
-    nohup env ROC_SDK_HOME="$SDK_HOME" ROC_SERVER_URL="$SERVER_URL" ROC_ALLOW_SOFTWARE_IDENTITY="$SOFTWARE_IDENTITY_ENV" "$INSTALL_DIR/roc-robot-tpm-sdk.sh" agent "$robot_id" "$SERVER_URL" > "$SDK_HOME/agent.log" 2>&1 &
-    log "Agent started in background. Log: $SDK_HOME/agent.log"
-    return 0
+  if [ "$(id -u)" != "0" ] && ! require_cmd sudo; then
+    log "System service needs sudo. Use an administrator account or configure a supervisor manually."
+    return 1
   fi
 
   printf '%s\n' "$robot_id" > "$SDK_HOME/robot-id"
@@ -479,7 +454,7 @@ install_systemd_service() {
   rm -f "$SDK_HOME/output/heartbeat-server-response.json"
 
   log "Installing systemd service: $SERVICE_NAME.service"
-  sudo tee "/etc/systemd/system/$SERVICE_NAME.service" >/dev/null <<SERVICE
+  sudo_cmd tee "/etc/systemd/system/$SERVICE_NAME.service" >/dev/null <<SERVICE
 [Unit]
 Description=RoboCoin DeRAS SDK Agent
 After=network-online.target
@@ -508,9 +483,9 @@ StandardError=journal
 WantedBy=multi-user.target
 SERVICE
 
-  sudo systemctl daemon-reload
-  sudo systemctl enable "$SERVICE_NAME"
-  sudo systemctl restart "$SERVICE_NAME"
+  sudo_cmd systemctl daemon-reload
+  sudo_cmd systemctl enable "$SERVICE_NAME"
+  sudo_cmd systemctl restart "$SERVICE_NAME"
   log "Service started: $SERVICE_NAME"
   log "Check status: sudo systemctl status $SERVICE_NAME"
   log "View logs: sudo journalctl -u $SERVICE_NAME -f"
@@ -522,7 +497,7 @@ run_doctor_summary() {
     sudo env ROC_SDK_HOME="$SDK_HOME" "$INSTALL_DIR/roc-robot-tpm-sdk.sh" doctor "$SERVER_URL" || true
     return 0
   fi
-  "$INSTALL_DIR/roc-robot-tpm-sdk.sh" doctor "$SERVER_URL" || true
+  ROC_SDK_HOME="$SDK_HOME" "$INSTALL_DIR/roc-robot-tpm-sdk.sh" doctor || true
 }
 
 wait_for_heartbeat_verified() {
@@ -532,35 +507,45 @@ wait_for_heartbeat_verified() {
   local response_file="$SDK_HOME/output/heartbeat-server-response.json"
 
   log "Waiting for verified heartbeat robotId=$robot_id (${timeout}s timeout)..."
-  while [ "$waited" -le "$timeout" ]; do
-    if [ -f "$response_file" ] &&
-      grep -q '"code":200' "$response_file" 2>/dev/null &&
-      grep -Eq "\"robotId\"[[:space:]]*:[[:space:]]*$robot_id" "$response_file" 2>/dev/null; then
+  while :; do
+    if python3 "$INSTALL_DIR/sdk-checks.py" heartbeat "$response_file" "$robot_id"; then
       log "Heartbeat verified by server."
       return 0
     fi
+    [ "$waited" -lt "$timeout" ] || break
     sleep 5
     waited=$((waited + 5))
   done
 
-  log "Heartbeat was not verified within ${timeout}s."
-  log "Last heartbeat response:"
-  if [ -f "$response_file" ]; then
-    sed -n '1,5p' "$response_file"
-  else
-    log "No heartbeat response file found at $response_file"
-  fi
-  if require_cmd systemctl && [ -d /run/systemd/system ] && require_cmd sudo; then
-    sudo systemctl --no-pager --full status "$SERVICE_NAME" || true
-  fi
-  exit 1
+  log "Binding completed, but heartbeat is not verified yet. Refresh the robot in DeRAS, confirm the device if prompted, and run SDK doctor if it remains offline. Do not reuse the binding token."
 }
 
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  --version) printf '%s\n' "$SDK_VERSION"; exit 0 ;;
+esac
 SDK_BINDING_TOKEN="${1:-}"
 SERVER_URL="${2:-$DEFAULT_SERVER_URL}"
 
-if [ -z "$SDK_BINDING_TOKEN" ] || [ "$SDK_BINDING_TOKEN" = "-h" ] || [ "$SDK_BINDING_TOKEN" = "--help" ]; then
+if [ -z "$SDK_BINDING_TOKEN" ]; then
   usage
+  exit 1
+fi
+
+case "$ROC_ADAPTERS" in
+  none|go2|"") ;;
+  *) log "Unknown adapter selection. Choose none or go2."; exit 1 ;;
+esac
+if [ "$TEST_MODE" = "1" ] && [ -n "$ROC_ADAPTERS" ] && [ "$ROC_ADAPTERS" != "none" ]; then
+  log "Offline test mode only supports Core (ROC_ADAPTERS=none)."
+  exit 1
+fi
+if [ -e "$INSTALL_DIR" ] && [ ! -d "$INSTALL_DIR/.git" ]; then
+  log "Install destination already exists and is not an SDK checkout. Choose a new path with ROC_SDK_INSTALL_DIR."
+  exit 1
+fi
+if [ "$TEST_MODE" != "1" ] && require_cmd systemctl && [ -d /run/systemd/system ] && [ "$(id -u)" != "0" ] && ! require_cmd sudo; then
+  log "sudo is required to install the Linux system service."
   exit 1
 fi
 
@@ -572,6 +557,9 @@ log "Device profile: $DEVICE_PROFILE"
 log "Requested adapters: $ROC_ADAPTERS"
 
 configure_identity_policy
+if [ "$TEST_MODE" = "1" ]; then
+  ROC_SKIP_DEP_INSTALL=1
+fi
 install_dependencies_if_needed
 check_system_time
 if [ "$TEST_MODE" != "1" ]; then
@@ -579,36 +567,33 @@ if [ "$TEST_MODE" != "1" ]; then
 else
   log "Test mode: skipping server availability check."
 fi
-stop_existing_agent
-mkdir -p "$SDK_HOME"
-
 if [ -d "$INSTALL_DIR/.git" ]; then
   log "SDK directory exists. Pulling latest version..."
-  if ! git -C "$INSTALL_DIR" pull --ff-only; then
-    BACKUP_DIR="${INSTALL_DIR}.backup.$(date +%Y%m%d%H%M%S)"
-    log "Existing SDK directory has local changes or pull failed. Backing it up to: $BACKUP_DIR"
-    mv "$INSTALL_DIR" "$BACKUP_DIR"
-    log "Cloning SDK repository again..."
-    git clone "$DEFAULT_REPO_URL" "$INSTALL_DIR"
+  if [ "$(git -C "$INSTALL_DIR" remote get-url origin 2>/dev/null || true)" != "$DEFAULT_REPO_URL" ]; then
+    log "Install directory has a different origin. Use the matching ROC_SDK_REPO_URL or a new directory."
+    exit 1
   fi
+  git -C "$INSTALL_DIR" pull --ff-only
 else
   log "Cloning SDK repository..."
-  rm -rf "$INSTALL_DIR"
   git clone "$DEFAULT_REPO_URL" "$INSTALL_DIR"
 fi
 
 chmod +x "$INSTALL_DIR/roc-robot-tpm-sdk.sh"
 chmod +x "$INSTALL_DIR/adapters/go2/install.sh" 2>/dev/null || true
 
-mkdir -p "$SDK_HOME"
-install_requested_adapters
 if [ "$TEST_MODE" = "1" ]; then
-  log "Test mode: Core files and optional adapter selection validated; binding and service start skipped."
+  log "Test mode: Core files installed; binding and services were not touched."
   exit 0
 fi
+mkdir -p "$SDK_HOME"
 run_sdk_bind
 ROBOT_ID="$(read_robot_id)"
+stop_existing_agent
+install_requested_adapters
 install_systemd_service "$ROBOT_ID"
 run_doctor_summary
-wait_for_heartbeat_verified "$ROBOT_ID"
-log "Install complete. Return to the web page and refresh the robot list."
+if require_cmd systemctl && [ -d /run/systemd/system ]; then
+  wait_for_heartbeat_verified "$ROBOT_ID"
+fi
+log "Installation and binding complete. Confirm online status in DeRAS before using the device."
