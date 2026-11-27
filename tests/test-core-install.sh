@@ -26,4 +26,18 @@ bash "$REPO_ROOT/install.sh" test-token http://127.0.0.1:9
 test -x "$SANDBOX/install/roc-robot-tpm-sdk.sh"
 test -f "$SANDBOX/install/ADAPTER-CONTRACT.md"
 test -f "$SANDBOX/install/adapters/go2/adapter.json"
+test -f "$SANDBOX/install/sdk-checks.py"
+test ! -e "$SANDBOX/home"
+"$SANDBOX/install/roc-robot-tpm-sdk.sh" check-adapter "$SANDBOX/install/adapters/go2"
+mkdir -p "$SANDBOX/existing"
+touch "$SANDBOX/existing/keep-me"
+if ROC_SDK_INSTALL_DIR="$SANDBOX/existing" ROC_SDK_TEST_MODE=1 bash "$REPO_ROOT/install.sh" ignored; then
+  printf 'Installer unexpectedly accepted a non-checkout destination.\n' >&2
+  exit 1
+fi
+test -f "$SANDBOX/existing/keep-me"
+if ROC_SDK_INSTALL_DIR="$SANDBOX/no-adapter" ROC_SDK_TEST_MODE=1 ROC_ADAPTERS=go2 bash "$REPO_ROOT/install.sh" ignored; then
+  printf 'Offline mode unexpectedly accepted a hardware adapter.\n' >&2
+  exit 1
+fi
 printf 'Core installation smoke test passed.\n'
