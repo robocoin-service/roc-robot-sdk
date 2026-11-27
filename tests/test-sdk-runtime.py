@@ -132,6 +132,83 @@ class RuntimeTests(unittest.TestCase):
                 server.shutdown()
                 thread.join(timeout=5)
 
+    def test_agent_recovers_and_signs_stage_challenge(self):
+        runtime = self
+        accepted = threading.Event()
+        stage_reports = []
+        errors = []
+        payload = "verificationId=83;orderId=13;taskId=29;robotId=7;stage=START;nonce=testing\n"
+        challenge = dict(hasChallenge=True, verificationId=83, orderId=13, taskId=29,
+                         robotId=7, stage="START", nonce="testing", challengePayload=payload)
+
+        class Handler(BaseHTTPRequestHandler):
+            polls = 0
+
+            def log_message(self, *_):
+                pass
+
+            def respond(self, data):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(data).encode())
+
+            def do_GET(self):
+                Handler.polls += 1
+                self.respond({"code": 200, "data": {
+                    1: {"hasChallenge": True},
+                    2: dict(challenge, robotId=8),
+                    3: challenge,
+                    4: challenge,
+                }.get(Handler.polls, {"hasChallenge": False})})
+
+            def do_POST(self):
+                try:
+                    data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                    if self.path == "/user/sdkAgent/heartbeat":
+                        self.respond({"code": 200, "data": {"robotId": 7, "signatureVerified": True}})
+                        return
+                    runtime.assertEqual(self.path, "/user/sdkStageReport")
+                    stage_reports.append(data)
+                    check = runtime.root / "stage-test"
+                    check.write_bytes(payload.encode())
+                    signature = runtime.root / "signature"
+                    signature.write_bytes(base64.b64decode(data["signature"], validate=True))
+                    subprocess.run(["openssl", "dgst", "-sha256", "-verify",
+                                    str(runtime.home / "tpm/robocoin-software-signing-public.pem"),
+                                    "-signature", str(signature), str(check)], check=True, capture_output=True)
+                    runtime.assertEqual(data["signaturePayload"], payload)
+                    for key in ("robotId", "verificationId", "orderId", "taskId", "stage", "nonce"):
+                        runtime.assertEqual(data[key], challenge[key])
+                    if len(stage_reports) == 1:
+                        self.respond({"code": 503})
+                        return
+                    self.respond({"code": 200, "data": {"verificationId": 83, "signatureVerified": True}})
+                    accepted.set()
+                except Exception as error:
+                    errors.append(error)
+                    self.respond({"code": 500})
+                    accepted.set()
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = f"http://127.0.0.1:{server.server_port}"
+                with subprocess.Popen(["bash", str(SDK), "agent", "7", url], env=self.env,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as agent:
+                    try:
+                        self.assertTrue(accepted.wait(9), f"no accepted stage after {Handler.polls} polls; agent exit={agent.poll()}")
+                        self.assertEqual(errors, [])
+                        self.assertEqual(len(stage_reports), 2)
+                        self.assertIsNone(agent.poll())
+                    finally:
+                        agent.terminate()
+                        agent.wait(timeout=10)
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+
 
 if __name__ == "__main__":
     unittest.main()
