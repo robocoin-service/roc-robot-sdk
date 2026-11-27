@@ -118,8 +118,12 @@ prepare(){
 }
 
 sign(){
-  if [ "$IDENTITY_MODE" = "TPM" ]; then tpm2_sign -c "$TPM_HANDLE" -g sha256 -s rsassa -f plain -o "$SCRATCH_DIR/signature.bin" "$SCRATCH_DIR/payload.txt"; else openssl dgst -sha256 -sign "$KEY_PRIV" -out "$SCRATCH_DIR/signature.bin" "$SCRATCH_DIR/payload.txt"; fi
-  openssl dgst -sha256 -verify "$KEY_PEM" -signature "$SCRATCH_DIR/signature.bin" "$SCRATCH_DIR/payload.txt" >/dev/null
+  if [ "$IDENTITY_MODE" = "TPM" ]; then
+    tpm2_sign -c "$TPM_HANDLE" -g sha256 -s rsassa -f plain -o "$SCRATCH_DIR/signature.bin" "$SCRATCH_DIR/payload.txt" || return 1
+  else
+    openssl dgst -sha256 -sign "$KEY_PRIV" -out "$SCRATCH_DIR/signature.bin" "$SCRATCH_DIR/payload.txt" || return 1
+  fi
+  openssl dgst -sha256 -verify "$KEY_PEM" -signature "$SCRATCH_DIR/signature.bin" "$SCRATCH_DIR/payload.txt" >/dev/null || return 1
   base64 -w 0 "$SCRATCH_DIR/signature.bin" 2>/dev/null || base64 -i "$SCRATCH_DIR/signature.bin" | tr -d '\n'
 }
 
@@ -155,7 +159,8 @@ heartbeat(){
   at="$(date '+%Y-%m-%d %H:%M:%S')"; nonce="$(date +%s%N)-$(rand)"; interval="${ROC_HEARTBEAT_INTERVAL_SECONDS:-30}"
   go2_bridge_url="$(detect_go2_bridge_url)"
   payload="event=HEARTBEAT;robotId=$ROBOT_ID;publicKeyFingerprint=$PUBLIC_KEY_FINGERPRINT;machineFingerprint=$MACHINE_FINGERPRINT;sdkVersion=$SDK_VERSION;go2BridgeUrl=$go2_bridge_url;nonce=$nonce;heartbeatAt=$at"
-  printf '%s' "$payload" > "$SCRATCH_DIR/payload.txt"; sig="$(sign)"
+  printf '%s' "$payload" > "$SCRATCH_DIR/payload.txt" || return 1
+  sig="$(sign)" || return 1
   cat > "$OUTPUT_DIR/heartbeat-report.json" <<JSON
 {"robotId":$ROBOT_ID,"sdkVersion":$(jv "$SDK_VERSION"),"deviceType":"LINUX_GO2_ADAPTIVE_ROBOT","computerName":$(jv "$COMPUTER_NAME"),"cpuModel":$(jv "$CPU_MODEL"),"machineFingerprint":$(jv "$MACHINE_FINGERPRINT"),"publicKeyFingerprint":$(jv "$PUBLIC_KEY_FINGERPRINT"),"platformIdentityType":$(jv "$PLATFORM_IDENTITY_TYPE"),"platformIdentityFingerprint":$(jv "$PLATFORM_IDENTITY_FINGERPRINT"),"go2NetworkInterface":$(jv "$GO2_NETWORK_INTERFACE"),"go2BridgeUrl":$(jv "$go2_bridge_url"),"go2SdkDetected":$GO2_SDK_DETECTED,"go2StateReadable":$GO2_STATE_READABLE,"heartbeatAt":$(jv "$at"),"heartbeatIntervalSeconds":$interval,"nonce":$(jv "$nonce"),"signatureAlgorithm":"RSASSA-SHA256","signaturePrivateKey":$(jv "$SIGNATURE_PRIVATE_KEY_LABEL"),"signaturePayload":$(jv "$payload"),"signature":$(jv "$sig")}
 JSON
@@ -168,10 +173,34 @@ JSON
 }
 
 stage_report(){
-  payload="$CHALLENGE_PAYLOAD"; printf '%s' "$payload" > "$SCRATCH_DIR/payload.txt"; sig="$(sign)"
+  payload="$CHALLENGE_PAYLOAD"
+  printf '%s' "$payload" > "$SCRATCH_DIR/payload.txt" || return 1
+  sig="$(sign)" || return 1
   cat > "$OUTPUT_DIR/stage-report.json" <<JSON
 {"verificationId":$VERIFICATION_ID,"orderId":$ORDER_ID,"taskId":$TASK_ID,"robotId":$ROBOT_ID,"stage":$(jv "$STAGE"),"nonce":$(jv "$NONCE"),"sdkVersion":$(jv "$SDK_VERSION"),"deviceType":"LINUX_GO2_ADAPTIVE_ROBOT","publicKeyFingerprint":$(jv "$PUBLIC_KEY_FINGERPRINT"),"signatureAlgorithm":"RSASSA-SHA256","signaturePrivateKey":$(jv "$SIGNATURE_PRIVATE_KEY_LABEL"),"signaturePayload":$(jv "$payload"),"signature":$(jv "$sig"),"computerName":$(jv "$COMPUTER_NAME"),"cpuModel":$(jv "$CPU_MODEL"),"machineFingerprint":$(jv "$MACHINE_FINGERPRINT"),"platformIdentityType":$(jv "$PLATFORM_IDENTITY_TYPE"),"platformIdentityFingerprint":$(jv "$PLATFORM_IDENTITY_FINGERPRINT"),"go2NetworkInterface":$(jv "$GO2_NETWORK_INTERFACE"),"go2SdkDetected":$GO2_SDK_DETECTED,"go2StateReadable":$GO2_STATE_READABLE,"collectedAt":$(jv "$COLLECTED_AT")}
 JSON
+}
+
+load_challenge(){
+  IFS= read -r -d '' VERIFICATION_ID &&
+    IFS= read -r -d '' ORDER_ID &&
+    IFS= read -r -d '' TASK_ID &&
+    IFS= read -r -d '' STAGE &&
+    IFS= read -r -d '' NONCE &&
+    IFS= read -r -d '' CHALLENGE_PAYLOAD
+}
+
+submit_stage(){
+  stage_report || { log "Stage challenge could not be signed."; return 1; }
+  local resp
+  resp="$(post "$OUTPUT_DIR/stage-report.json" "${SERVER_URL%/}/user/sdkStageReport")"
+  printf '%s\n' "$resp" > "$OUTPUT_DIR/stage-server-response.json" || return 1
+  if python3 "$SDK_ROOT/sdk-checks.py" stage "$OUTPUT_DIR/stage-server-response.json" "$VERIFICATION_ID"; then
+    log "Stage signature verified by DeRAS."
+    return 0
+  fi
+  log "DeRAS did not confirm the stage signature."
+  return 1
 }
 
 case "$MODE" in
@@ -187,22 +216,21 @@ if [ "$MODE" = "service" ] || [ "$MODE" = "agent" ]; then
     now="$(date +%s)"; interval="${ROC_HEARTBEAT_INTERVAL_SECONDS:-30}"
     [ $((now-last)) -ge "$interval" ] && heartbeat && last="$now"
     pending="$(curl -fsS --connect-timeout 5 --max-time 10 "${SERVER_URL%/}/user/sdkAgent/pendingChallenge?robotId=$ROBOT_ID&publicKeyFingerprint=$PUBLIC_KEY_FINGERPRINT" || true)"
-    has="$(printf '%s' "$pending" | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("data",{}).get("hasChallenge",False)).lower())' 2>/dev/null || echo false)"
-    if [ "$has" = "true" ]; then
-      tmp="$WORK_DIR/pending.json"; printf '%s' "$pending" > "$tmp"
-      VERIFICATION_ID="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["verificationId"])' < "$tmp")"
-      ORDER_ID="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["orderId"])' < "$tmp")"
-      TASK_ID="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["taskId"])' < "$tmp")"
-      STAGE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["stage"])' < "$tmp")"
-      NONCE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["nonce"])' < "$tmp")"
-      CHALLENGE_PAYLOAD="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["challengePayload"])' < "$tmp")"
-      stage_report; post "$OUTPUT_DIR/stage-report.json" "${SERVER_URL%/}/user/sdkStageReport" | tee "$OUTPUT_DIR/stage-server-response.json"
+    if load_challenge < <(printf '%s' "$pending" | python3 "$SDK_ROOT/sdk-checks.py" challenge "$ROBOT_ID"); then
+      submit_stage || true
     fi
     sleep "${ROC_AGENT_INTERVAL_SECONDS:-3}"
   done
 fi
 
-if [ "$MODE" = "stage" ]; then stage_report; post "$OUTPUT_DIR/stage-report.json" "${SERVER_URL%/}/user/sdkStageReport" | tee "$OUTPUT_DIR/stage-server-response.json"; exit 0; fi
+if [ "$MODE" = "stage" ]; then
+  [[ "$VERIFICATION_ID" =~ ^[1-9][0-9]*$ && "$ORDER_ID" =~ ^[1-9][0-9]*$ && "$TASK_ID" =~ ^[1-9][0-9]*$ && -n "$STAGE" && -n "$NONCE" && -n "$CHALLENGE_PAYLOAD" ]] || {
+    echo "Stage verification ID, order ID, task ID, stage, nonce and challenge payload are required." >&2
+    exit 1
+  }
+  submit_stage
+  exit 0
+fi
 
 [ "$MODE" = "bind" ] || [ "$MODE" = "install" ] || exit 0
 [ -n "$SDK_BINDING_TOKEN" ] || { echo "sdkBindingToken is required" >&2; exit 1; }

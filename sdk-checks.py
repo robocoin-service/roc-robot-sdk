@@ -44,6 +44,24 @@ def accepted_heartbeat(text, expected_id):
     return bool(expected_id and robot_id(verified_data(text).get("robotId")) == expected_id)
 
 
+def pending_challenge(text, expected_id):
+    result = response(text)
+    data = result.get("data")
+    if str(result.get("code")) != "200" or not isinstance(data, dict) or data.get("hasChallenge") is not True:
+        return None
+    if not expected_id or robot_id(data.get("robotId")) != expected_id:
+        return None
+    ids = [robot_id(data.get(key)) for key in ("verificationId", "orderId", "taskId")]
+    fields = [data.get(key) for key in ("stage", "nonce", "challengePayload")]
+    if not all(ids) or not all(isinstance(value, str) and value.strip() and "\0" not in value for value in fields):
+        return None
+    return ids + fields
+
+
+def accepted_stage(text, expected_id):
+    return bool(expected_id and robot_id(verified_data(text).get("verificationId")) == expected_id)
+
+
 def local_status(home, version):
     saved_id = robot_id(read(home / "robot-id"))
     file = home / "output" / "heartbeat-server-response.json"
@@ -97,6 +115,13 @@ def main(argv):
         return 0 if found else 1
     if len(argv) == 3 and argv[0] == "heartbeat":
         return 0 if accepted_heartbeat(read(Path(argv[1])), robot_id(argv[2])) else 1
+    if len(argv) == 2 and argv[0] == "challenge":
+        fields = pending_challenge(sys.stdin.read(), robot_id(argv[1]))
+        if fields:
+            sys.stdout.buffer.write(("\0".join(fields) + "\0").encode("utf-8"))
+        return 0 if fields else 1
+    if len(argv) == 3 and argv[0] == "stage":
+        return 0 if accepted_stage(read(Path(argv[1])), robot_id(argv[2])) else 1
     if len(argv) in (3, 4) and argv[0] == "status" and argv[3:] in ([], ["--json"]):
         status = local_status(Path(argv[1]), argv[2])
         if argv[3:]:
@@ -112,7 +137,7 @@ def main(argv):
         except (ValueError, OSError, RuntimeError) as error:
             print(f"Adapter validation failed: {error}", file=sys.stderr)
             return 1
-    print("Usage: sdk-checks.py bind | heartbeat <file> <robotId> | status <sdkHome> <version> [--json] | check-adapter <directory>", file=sys.stderr)
+    print("Usage: sdk-checks.py bind | heartbeat <file> <robotId> | challenge <robotId> | stage <file> <verificationId> | status <sdkHome> <version> [--json] | check-adapter <directory>", file=sys.stderr)
     return 2
 
 
